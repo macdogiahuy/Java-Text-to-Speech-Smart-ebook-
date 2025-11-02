@@ -1,0 +1,9 @@
+com\mycompany\tts\resources\JakartaEE10Resource.class
+com\yourcompany\ebook\EbookProcessorServlet$ChapterContent.class
+com\yourcompany\ebook\EbookProcessorServlet$EbookMetadata.class
+com\mycompany\tts\JakartaRestConfiguration.class
+com\yourcompany\ebook\EbookProcessorServlet$IflytekAuthContext.class
+com\yourcompany\ebook\EbookProcessorServlet.class
+com\yourcompany\ebook\EbookProcessorServlet$ChapterResult.class
+com\yourcompany\ebook\EbookProcessorServlet$IflytekTtsListener.class
+com\yourcompany\ebook\AudioStreamServlet.class
