@@ -70,13 +70,13 @@ public class EbookProcessorServlet extends HttpServlet {
   private static final long serialVersionUID = 1L;
 
   // TODO: Replace placeholders with actual keys before production deploy.
-  private static final String GEMINI_API_KEY = "AIzaSyDhqpdjSISltQ1tZk7ej7oXc54yfs2UNhA"; // Set via secure configbefore
-                                                                                          // deployment
+  private static final String GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"; // Set via secure configbefore
+                                                                      // deployment
   private static final String IFLYTEK_TTS_ENDPOINT = "wss://tts-api-sg.xf-yun.com/v2/tts";
   // TODO: Replace with secure configuration before deployment.
-  private static final String IFLYTEK_APP_ID = "ga808480";
-  private static final String IFLYTEK_API_KEY = "d742d908cae15e294634326dcb3b48c2";
-  private static final String IFLYTEK_API_SECRET = "1ef679ae0116ef363d4b4b3c5f8d3a4b";
+  private static final String IFLYTEK_APP_ID = "YOUR_IFLYTEK_APP_ID";
+  private static final String IFLYTEK_API_KEY = "YOUR_IFLYTEK_API_KEY";
+  private static final String IFLYTEK_API_SECRET = "YOUR_IFLYTEK_API_SECRET";
   private static final String IFLYTEK_DEFAULT_VOICE = "xiaoyun";
   private static final String IFLYTEK_DEFAULT_AUE = "lame";
   private static final String IFLYTEK_DEFAULT_TTE = "UTF8";
