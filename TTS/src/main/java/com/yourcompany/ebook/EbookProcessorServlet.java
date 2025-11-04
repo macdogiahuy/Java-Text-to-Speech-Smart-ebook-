@@ -17,6 +17,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
+import java.text.Normalizer;
 import java.time.Duration;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
@@ -24,6 +25,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Calendar;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -44,6 +46,9 @@ import javax.sound.sampled.AudioSystem;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDDocumentInformation;
 import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.poi.ooxml.POIXMLProperties;
+import org.apache.poi.openxml4j.util.ZipSecureFile;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
 
 import com.google.genai.Client;
 import com.google.genai.types.GenerateContentResponse;
@@ -65,12 +70,13 @@ public class EbookProcessorServlet extends HttpServlet {
   private static final long serialVersionUID = 1L;
 
   // TODO: Replace placeholders with actual keys before production deploy.
-  private static final String GEMINI_API_KEY = "PASTE_GEMINI_API_KEY_HERE"; // Set via secure config before deployment
+  private static final String GEMINI_API_KEY = "AIzaSyDhqpdjSISltQ1tZk7ej7oXc54yfs2UNhA"; // Set via secure configbefore
+                                                                                          // deployment
   private static final String IFLYTEK_TTS_ENDPOINT = "wss://tts-api-sg.xf-yun.com/v2/tts";
   // TODO: Replace with secure configuration before deployment.
-  private static final String IFLYTEK_APP_ID = "REPLACE_WITH_IFLYTEK_APP_ID";
-  private static final String IFLYTEK_API_KEY = "REPLACE_WITH_IFLYTEK_API_KEY";
-  private static final String IFLYTEK_API_SECRET = "REPLACE_WITH_IFLYTEK_API_SECRET";
+  private static final String IFLYTEK_APP_ID = "ga808480";
+  private static final String IFLYTEK_API_KEY = "d742d908cae15e294634326dcb3b48c2";
+  private static final String IFLYTEK_API_SECRET = "1ef679ae0116ef363d4b4b3c5f8d3a4b";
   private static final String IFLYTEK_DEFAULT_VOICE = "xiaoyun";
   private static final String IFLYTEK_DEFAULT_AUE = "lame";
   private static final String IFLYTEK_DEFAULT_TTE = "UTF8";
@@ -80,12 +86,25 @@ public class EbookProcessorServlet extends HttpServlet {
   private static final Duration IFLYTEK_WS_TIMEOUT = Duration.ofSeconds(90);
   private static final String LOCAL_AUDIO_OUTPUT_DIR_NAME = "test-audio-output";
   private static final int MAX_SUMMARY_SOURCE_CHARACTERS = 6000;
-  private static final String[] GEMINI_MODEL_CANDIDATES = {
+  private static final String[] GEMINI_MODEL_VI = {
+      "gemini-2.5-flash",
+      "gemini-2.5-pro",
+      "gemini-2.5-flash-lite" };
+  private static final String[] GEMINI_MODEL_EN = {
       "gemini-2.5-flash",
       "gemini-2.5-pro",
       "gemini-2.5-flash-lite" };
   private static final DateTimeFormatter IFLYTEK_RFC1123_FORMATTER = DateTimeFormatter
       .ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US);
+  private static final char COMBINING_BREVE = '\u0306';
+  private static final char COMBINING_HORN = '\u031B';
+  private static final int DEFAULT_POI_MAX_FILE_COUNT = 20_000;
+  private static final int MIN_POI_MAX_FILE_COUNT = 1_000;
+  private static final int MAX_POI_MAX_FILE_COUNT = 200_000;
+  private static final double DEFAULT_POI_MIN_INFLATE_RATIO = 0.001d;
+  private static final double MIN_POI_MIN_INFLATE_RATIO = 0.0d;
+  private static final double MAX_POI_MIN_INFLATE_RATIO = 0.01d;
+  private static volatile boolean docxZipSecureConfigured;
 
   private static final Pattern CHAPTER_HEADING_PATTERN = Pattern.compile(
       "(?im)^(chapter\\s+(\\d+|[ivxlcdm]+)\\b.*|chương\\s+\\d+\\b.*|chapitre\\s+\\d+\\b.*|ch\\.?\\s*\\d+\\b.*|\\d+\\.\\s+chapter\\b.*)$");
@@ -109,22 +128,55 @@ public class EbookProcessorServlet extends HttpServlet {
     response.sendRedirect(request.getContextPath() + "/index.jsp");
   }
 
+  private DocumentContents loadDocument(Part ebookPart, String uploadedFileName) throws IOException {
+    String extension = extractFileExtension(uploadedFileName);
+    if ("pdf".equals(extension)) {
+      try (InputStream inputStream = ebookPart.getInputStream(); PDDocument document = PDDocument.load(inputStream)) {
+        String fullText = extractFullText(document);
+        EbookMetadata metadata = extractPdfMetadata(document, uploadedFileName, fullText);
+        DocumentLanguage language = detectDocumentLanguage(fullText);
+        return new DocumentContents(fullText, metadata, language);
+      }
+    }
+    if ("docx".equals(extension)) {
+      configureZipSecureFileLimits();
+      try (InputStream inputStream = ebookPart.getInputStream();
+          XWPFDocument document = new XWPFDocument(inputStream)) {
+        String fullText = extractFullText(document);
+        EbookMetadata metadata = extractDocxMetadata(document, uploadedFileName, fullText);
+        DocumentLanguage language = detectDocumentLanguage(fullText);
+        return new DocumentContents(fullText, metadata, language);
+      }
+    }
+    throw new IllegalStateException("Định dạng tệp không được hỗ trợ. Vui lòng tải lên PDF hoặc DOCX.");
+  }
+
+  private String extractFileExtension(String fileName) {
+    if (fileName == null) {
+      return "";
+    }
+    int dotIndex = fileName.lastIndexOf('.');
+    if (dotIndex < 0 || dotIndex >= fileName.length() - 1) {
+      return "";
+    }
+    return fileName.substring(dotIndex + 1).toLowerCase(Locale.ROOT);
+  }
+
   @Override
   protected void doPost(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
-    Part pdfPart = request.getPart("ebook");
-    if (pdfPart == null || pdfPart.getSize() == 0) {
-      forwardWithError(request, response, "Vui lòng chọn một tệp PDF để tải lên.");
+    Part ebookPart = request.getPart("ebook");
+    if (ebookPart == null || ebookPart.getSize() == 0) {
+      forwardWithError(request, response, "Vui lòng chọn một tệp PDF hoặc DOCX để tải lên.");
       return;
     }
 
-    String uploadedFileName = Paths.get(pdfPart.getSubmittedFileName()).getFileName().toString();
-    try (InputStream pdfInputStream = pdfPart.getInputStream(); PDDocument document = PDDocument.load(pdfInputStream)) {
-      String fullText = extractFullText(document);
-      EbookMetadata metadata = extractMetadata(document, uploadedFileName, fullText);
+    String uploadedFileName = Paths.get(ebookPart.getSubmittedFileName()).getFileName().toString();
+    try {
+      DocumentContents document = loadDocument(ebookPart, uploadedFileName);
 
-      List<ChapterContent> chapters = splitIntoChapters(fullText);
+      List<ChapterContent> chapters = splitIntoChapters(document.getFullText());
       if (chapters.isEmpty()) {
-        forwardWithError(request, response, "Không tìm thấy nội dung chương hợp lệ trong ebook.");
+        forwardWithError(request, response, "Không tìm thấy nội dung chương hợp lệ trong tài liệu.");
         return;
       }
 
@@ -133,12 +185,12 @@ public class EbookProcessorServlet extends HttpServlet {
       List<ChapterResult> chapterResults = new ArrayList<>();
 
       for (ChapterContent chapter : chapters) {
-        String summary = summarizeTextWithGemini(chapter.getTitle(), chapter.getBody());
+        String summary = summarizeTextWithGemini(chapter.getTitle(), chapter.getBody(), document.getLanguage());
         Path audioFile = generateAudioWithIflytek(chapter.getTitle(), summary, audioDirectory);
         chapterResults.add(new ChapterResult(chapter.getTitle(), summary, audioFile.getFileName().toString()));
       }
 
-      request.setAttribute("metadata", metadata);
+      request.setAttribute("metadata", document.getMetadata());
       request.setAttribute("chapters", chapterResults);
       request.setAttribute("uploadedFileName", uploadedFileName);
 
@@ -147,11 +199,11 @@ public class EbookProcessorServlet extends HttpServlet {
       forwardWithError(request, response, ex.getMessage());
     } catch (Exception ex) {
       ex.printStackTrace();
-      forwardWithError(request, response, "Có lỗi xảy ra khi xử lý ebook: " + ex.getMessage());
+      forwardWithError(request, response, "Có lỗi xảy ra khi xử lý tài liệu: " + ex.getMessage());
     }
   }
 
-  private EbookMetadata extractMetadata(PDDocument document, String uploadedFileName, String fullText) {
+  private EbookMetadata extractPdfMetadata(PDDocument document, String uploadedFileName, String fullText) {
     PDDocumentInformation info = document.getDocumentInformation();
     String title = safeTrim(info != null ? info.getTitle() : null);
     String author = safeTrim(info != null ? info.getAuthor() : null);
@@ -193,6 +245,58 @@ public class EbookProcessorServlet extends HttpServlet {
       }
     }
 
+    if (year == null || year.isEmpty()) {
+      year = "Không rõ";
+    }
+
+    return new EbookMetadata(title, author, year, subject, keywords, producer);
+  }
+
+  private EbookMetadata extractDocxMetadata(XWPFDocument document, String uploadedFileName, String fullText) {
+    POIXMLProperties properties = document.getProperties();
+    POIXMLProperties.CoreProperties core = properties != null ? properties.getCoreProperties() : null;
+
+    String title = core != null ? safeTrim(core.getTitle()) : null;
+    String author = core != null ? safeTrim(core.getCreator()) : null;
+    String subject = core != null ? safeTrim(core.getSubject()) : null;
+    String keywords = core != null ? safeTrim(core.getKeywords()) : null;
+    String producer = null;
+
+    String year = null;
+    if (core != null) {
+      Date created = core.getCreated();
+      if (created != null) {
+        Calendar calendar = Calendar.getInstance();
+        calendar.setTime(created);
+        year = String.valueOf(calendar.get(Calendar.YEAR));
+      } else {
+        Date modified = core.getModified();
+        if (modified != null) {
+          Calendar calendar = Calendar.getInstance();
+          calendar.setTime(modified);
+          year = String.valueOf(calendar.get(Calendar.YEAR));
+        }
+      }
+    }
+
+    String fallbackBaseName = humanizeFilenameStem(extractBaseName(uploadedFileName));
+    if (title == null || title.isEmpty() || isGenericTitle(title)) {
+      title = fallbackBaseName != null ? fallbackBaseName : "Không rõ";
+    }
+
+    if (author == null || author.isEmpty()) {
+      author = guessAuthorFromText(fullText);
+    }
+    if (author == null || author.isEmpty()) {
+      author = "Không rõ";
+    }
+
+    if (subject != null && subject.equalsIgnoreCase(title)) {
+      subject = null;
+    }
+    if (keywords != null && keywords.equalsIgnoreCase(title)) {
+      keywords = null;
+    }
     if (year == null || year.isEmpty()) {
       year = "Không rõ";
     }
@@ -278,6 +382,23 @@ public class EbookProcessorServlet extends HttpServlet {
     return textStripper.getText(document);
   }
 
+  private String extractFullText(XWPFDocument document) {
+    StringBuilder builder = new StringBuilder();
+    document.getParagraphs().forEach(paragraph -> {
+      String text = paragraph.getText();
+      if (text != null && !text.isEmpty()) {
+        builder.append(text.trim()).append(System.lineSeparator());
+      }
+    });
+    document.getTables().forEach(table -> table.getRows().forEach(row -> row.getTableCells().forEach(cell -> {
+      String text = cell.getText();
+      if (text != null && !text.isEmpty()) {
+        builder.append(text.trim()).append(System.lineSeparator());
+      }
+    })));
+    return builder.toString();
+  }
+
   private List<ChapterContent> splitIntoChapters(String rawText) {
     List<ChapterContent> chapters = new ArrayList<>();
     if (rawText == null || rawText.isBlank()) {
@@ -321,29 +442,59 @@ public class EbookProcessorServlet extends HttpServlet {
     return clean;
   }
 
-  private String summarizeTextWithGemini(String chapterTitle, String chapterText) {
+  private DocumentLanguage detectDocumentLanguage(String text) {
+    if (text == null || text.isBlank()) {
+      throw new IllegalStateException("Không thể xác định ngôn ngữ tài liệu.");
+    }
+    String sample = text.length() > 8000 ? text.substring(0, 8000) : text;
+    String normalized = Normalizer.normalize(sample, Normalizer.Form.NFD);
+
+    boolean hasVietnameseMarkers = normalized.indexOf(COMBINING_BREVE) >= 0
+        || normalized.indexOf(COMBINING_HORN) >= 0
+        || normalized.indexOf('đ') >= 0
+        || normalized.indexOf('Đ') >= 0;
+    if (hasVietnameseMarkers) {
+      return DocumentLanguage.VIETNAMESE;
+    }
+
+    int asciiLetters = 0;
+    int nonAsciiLetters = 0;
+    for (int i = 0; i < normalized.length(); i++) {
+      char ch = normalized.charAt(i);
+      if (Character.isLetter(ch)) {
+        if (ch <= 127) {
+          asciiLetters++;
+        } else {
+          nonAsciiLetters++;
+        }
+      }
+    }
+
+    if (nonAsciiLetters > 0) {
+      throw new IllegalStateException("Tài liệu hiện chỉ hỗ trợ tiếng Việt hoặc tiếng Anh.");
+    }
+    if (asciiLetters == 0) {
+      throw new IllegalStateException("Không tìm thấy đủ văn bản để xác định ngôn ngữ.");
+    }
+    return DocumentLanguage.ENGLISH;
+  }
+
+  private String summarizeTextWithGemini(String chapterTitle, String chapterText, DocumentLanguage language) {
     ensureGeminiConfigured();
 
     String trimmedText = chapterText.length() > MAX_SUMMARY_SOURCE_CHARACTERS
         ? chapterText.substring(0, MAX_SUMMARY_SOURCE_CHARACTERS)
         : chapterText;
 
-    // Compose a detailed instructional prompt to obtain richer summaries for
-    // learners.
-    String prompt = String.format(Locale.forLanguageTag("vi"), String.join("%n",
-        "Bạn là giảng viên đang hướng dẫn học viên tự học. Hãy tạo bản tóm tắt chi tiết cho chương dưới đây bằng tiếng Việt.",
-        "Yêu cầu:",
-        "- Viết phần mở đầu 2-3 câu mô tả mục tiêu trọng tâm của chương.",
-        "- Liệt kê 4-6 gạch đầu dòng về khái niệm, công thức, bước thực hành quan trọng (giữ nguyên thuật ngữ chuyên ngành).",
-        "- Kết thúc bằng 1-2 câu nêu ứng dụng hoặc lưu ý khi học.",
-        "- Không bỏ qua ví dụ, số liệu nổi bật nếu có trong nội dung.",
-        "Tiêu đề chương: %s",
-        "Nội dung nguồn (đã cắt ngắn nếu quá dài):",
-        "%s"), chapterTitle, trimmedText);
+    String prompt = buildGeminiPrompt(language, chapterTitle, trimmedText);
 
     GenerateContentResponse response = null;
     RuntimeException lastModelException = null;
-    for (String modelName : GEMINI_MODEL_CANDIDATES) {
+    String[] candidates = geminiModelCandidates(language);
+    if (candidates.length == 0) {
+      throw new IllegalStateException("Không tìm thấy cấu hình model Gemini phù hợp cho ngôn ngữ.");
+    }
+    for (String modelName : candidates) {
       try {
         response = getGeminiClient().models.generateContent(modelName, prompt, null);
         lastModelException = null;
@@ -371,6 +522,110 @@ public class EbookProcessorServlet extends HttpServlet {
       throw new IllegalStateException("Gemini API không trả về nội dung tóm tắt.");
     }
     return summary.trim();
+  }
+
+  private void configureZipSecureFileLimits() {
+    if (docxZipSecureConfigured) {
+      return;
+    }
+    synchronized (EbookProcessorServlet.class) {
+      if (docxZipSecureConfigured) {
+        return;
+      }
+      int maxFileCount = resolvePoiMaxFileCount();
+      double minInflateRatio = resolvePoiMinInflateRatio();
+      ZipSecureFile.setMaxFileCount(maxFileCount);
+      ZipSecureFile.setMinInflateRatio(minInflateRatio);
+      docxZipSecureConfigured = true;
+    }
+  }
+
+  private static int resolvePoiMaxFileCount() {
+    return resolveIntConfig("POI_MAX_FILE_COUNT", "poi.max.file.count", DEFAULT_POI_MAX_FILE_COUNT,
+        MIN_POI_MAX_FILE_COUNT, MAX_POI_MAX_FILE_COUNT);
+  }
+
+  private static double resolvePoiMinInflateRatio() {
+    return resolveDoubleConfig("POI_MIN_INFLATE_RATIO", "poi.min.inflate.ratio", DEFAULT_POI_MIN_INFLATE_RATIO,
+        MIN_POI_MIN_INFLATE_RATIO, MAX_POI_MIN_INFLATE_RATIO);
+  }
+
+  private static int resolveIntConfig(String envName, String propertyName, int defaultValue, int minValue,
+      int maxValue) {
+    String value = System.getenv(envName);
+    if (value == null || value.isBlank()) {
+      value = System.getProperty(propertyName);
+    }
+    if (value == null || value.isBlank()) {
+      return defaultValue;
+    }
+    try {
+      int parsed = Integer.parseInt(value.trim());
+      if (parsed < minValue || parsed > maxValue) {
+        return defaultValue;
+      }
+      return parsed;
+    } catch (NumberFormatException ex) {
+      return defaultValue;
+    }
+  }
+
+  private static double resolveDoubleConfig(String envName, String propertyName, double defaultValue, double minValue,
+      double maxValue) {
+    String value = System.getenv(envName);
+    if (value == null || value.isBlank()) {
+      value = System.getProperty(propertyName);
+    }
+    if (value == null || value.isBlank()) {
+      return defaultValue;
+    }
+    try {
+      double parsed = Double.parseDouble(value.trim());
+      if (Double.isNaN(parsed) || parsed < minValue || parsed > maxValue) {
+        return defaultValue;
+      }
+      return parsed;
+    } catch (NumberFormatException ex) {
+      return defaultValue;
+    }
+  }
+
+  private String[] geminiModelCandidates(DocumentLanguage language) {
+    switch (language) {
+      case VIETNAMESE:
+        return GEMINI_MODEL_VI;
+      case ENGLISH:
+      default:
+        return GEMINI_MODEL_EN;
+    }
+  }
+
+  private String buildGeminiPrompt(DocumentLanguage language, String chapterTitle, String trimmedText) {
+    if (language == DocumentLanguage.VIETNAMESE) {
+      return String.format(Locale.forLanguageTag("vi"), String.join("%n",
+          "Bạn là giảng viên đang hướng dẫn học viên tự học. Hãy tạo bản tóm tắt chi tiết cho chương dưới đây bằng tiếng Việt.",
+          "Yêu cầu:",
+          "- Viết phần mở đầu 2-3 câu mô tả mục tiêu trọng tâm của chương.",
+          "- Liệt kê 4-6 gạch đầu dòng về khái niệm, công thức, bước thực hành quan trọng (giữ nguyên thuật ngữ chuyên ngành).",
+          "- Kết thúc bằng 1-2 câu nêu ứng dụng hoặc lưu ý khi học.",
+          "- Không bỏ qua ví dụ, số liệu nổi bật nếu có trong nội dung.",
+          "- Thêm 3-4 câu hỏi ôn tập ngắn gọn ở cuối (đánh số).",
+          "Tiêu đề chương: %s",
+          "Nội dung nguồn (đã cắt ngắn nếu quá dài):",
+          "%s"), chapterTitle, trimmedText);
+    }
+
+    return String.format(Locale.ENGLISH, String.join("%n",
+        "You are an instructor helping learners study independently. Create a detailed summary for the chapter below in English.",
+        "Instructions:",
+        "- Start with a 2-3 sentence introduction highlighting the chapter's main goals.",
+        "- Provide 4-6 bullet points covering key concepts, formulas, and practice steps (keep technical terminology intact).",
+        "- Conclude with 1-2 sentences describing practical applications or study tips.",
+        "- Retain any notable examples or figures present in the source text.",
+        "- Add 3-4 short revision questions at the end (numbered).",
+        "Chapter title: %s",
+        "Source content (truncated if necessary):",
+        "%s"), chapterTitle, trimmedText);
   }
 
   private Client getGeminiClient() {
@@ -1223,6 +1478,35 @@ public class EbookProcessorServlet extends HttpServlet {
     String normalized = message.toLowerCase(Locale.ROOT);
     return normalized.contains("404") || normalized.contains("not found")
         || normalized.contains("unsupported") || normalized.contains("does not exist");
+  }
+
+  private static final class DocumentContents {
+    private final String fullText;
+    private final EbookMetadata metadata;
+    private final DocumentLanguage language;
+
+    private DocumentContents(String fullText, EbookMetadata metadata, DocumentLanguage language) {
+      this.fullText = fullText;
+      this.metadata = metadata;
+      this.language = language;
+    }
+
+    private String getFullText() {
+      return fullText;
+    }
+
+    private EbookMetadata getMetadata() {
+      return metadata;
+    }
+
+    private DocumentLanguage getLanguage() {
+      return language;
+    }
+  }
+
+  private enum DocumentLanguage {
+    VIETNAMESE,
+    ENGLISH
   }
 
   @SuppressWarnings("unused")

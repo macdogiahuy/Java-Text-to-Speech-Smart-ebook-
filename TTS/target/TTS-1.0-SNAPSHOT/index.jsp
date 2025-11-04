@@ -79,8 +79,8 @@ language="java" %>
     <div class="container">
       <h1>Ebook to Audiobook Converter</h1>
       <p class="subtitle">
-        Tải lên ebook PDF của bạn để chuyển thành các bản tóm tắt âm thanh cho
-        từng chương.
+        Tải lên ebook PDF hoặc DOCX của bạn để chuyển thành các bản tóm tắt âm
+        thanh cho từng chương.
       </p>
 
       <form
@@ -89,12 +89,12 @@ language="java" %>
         enctype="multipart/form-data"
       >
         <div class="file-input">
-          <label for="ebook">Chọn tệp PDF</label>
+          <label for="ebook">Chọn tệp PDF hoặc DOCX</label>
           <input
             type="file"
             id="ebook"
             name="ebook"
-            accept="application/pdf"
+            accept="application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.pdf,.docx"
             required
           />
         </div>
