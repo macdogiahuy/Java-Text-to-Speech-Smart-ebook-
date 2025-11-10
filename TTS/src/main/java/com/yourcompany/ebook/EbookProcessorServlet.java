@@ -52,6 +52,8 @@ import org.apache.poi.xwpf.usermodel.XWPFDocument;
 
 import com.google.genai.Client;
 import com.google.genai.types.GenerateContentResponse;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
@@ -61,6 +63,7 @@ import jakarta.servlet.annotation.WebServlet;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.HttpSession;
 import jakarta.servlet.http.Part;
 
 @WebServlet(name = "EbookProcessorServlet", urlPatterns = "/process-ebook")
@@ -70,13 +73,13 @@ public class EbookProcessorServlet extends HttpServlet {
   private static final long serialVersionUID = 1L;
 
   // TODO: Replace placeholders with actual keys before production deploy.
-  private static final String GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"; // Set via secure configbefore
+  private static final String GEMINI_API_KEY = "Your-Gemini-API-Key"; // Set via secure configbefore
                                                                       // deployment
   private static final String IFLYTEK_TTS_ENDPOINT = "wss://tts-api-sg.xf-yun.com/v2/tts";
   // TODO: Replace with secure configuration before deployment.
-  private static final String IFLYTEK_APP_ID = "YOUR_IFLYTEK_APP_ID";
-  private static final String IFLYTEK_API_KEY = "YOUR_IFLYTEK_API_KEY";
-  private static final String IFLYTEK_API_SECRET = "YOUR_IFLYTEK_API_SECRET";
+  private static final String IFLYTEK_APP_ID = "Your-IFLYTEK-APP-ID";
+  private static final String IFLYTEK_API_KEY = "Your-IFLYTEK-API-KEY";
+  private static final String IFLYTEK_API_SECRET = "Your-IFLYTEK-API-SECRET";
   private static final String IFLYTEK_DEFAULT_VOICE = "xiaoyun";
   private static final String IFLYTEK_DEFAULT_AUE = "lame";
   private static final String IFLYTEK_DEFAULT_TTE = "UTF8";
@@ -106,6 +109,12 @@ public class EbookProcessorServlet extends HttpServlet {
   private static final double MAX_POI_MIN_INFLATE_RATIO = 0.01d;
   private static volatile boolean docxZipSecureConfigured;
 
+  // Ollama configuration defaults
+  private static final String OLLAMA_DEFAULT_LOCAL_HOST = "http://localhost:11434";
+  private static final String OLLAMA_DEFAULT_CLOUD_HOST = "https://ollama.com";
+  private static final String OLLAMA_DEFAULT_LOCAL_MODEL = "gpt-oss:20b";
+  private static final String OLLAMA_DEFAULT_CLOUD_MODEL = "gpt-oss:120b-cloud";
+
   private static final Pattern CHAPTER_HEADING_PATTERN = Pattern.compile(
       "(?im)^(chapter\\s+(\\d+|[ivxlcdm]+)\\b.*|chương\\s+\\d+\\b.*|chapitre\\s+\\d+\\b.*|ch\\.?\\s*\\d+\\b.*|\\d+\\.\\s+chapter\\b.*)$");
   private static final Pattern[] AUTHOR_HINT_PATTERNS = {
@@ -123,9 +132,78 @@ public class EbookProcessorServlet extends HttpServlet {
       .connectTimeout(Duration.ofSeconds(30))
       .build();
 
+  private static final Gson GSON = new Gson();
+
   @Override
   protected void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
     response.sendRedirect(request.getContextPath() + "/index.jsp");
+  }
+
+  @Override
+  protected void doPost(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
+    Part ebookPart = null;
+    try {
+      ebookPart = request.getPart("ebook");
+    } catch (IllegalStateException ex) {
+      // file too large or multipart error
+      forwardWithError(request, response, "Tệp tải lên quá lớn hoặc yêu cầu multipart không hợp lệ.");
+      return;
+    }
+
+    if (ebookPart == null || ebookPart.getSize() == 0) {
+      forwardWithError(request, response, "Vui lòng chọn một tệp PDF hoặc DOCX để tải lên.");
+      return;
+    }
+
+    String uploadedFileName = Paths.get(ebookPart.getSubmittedFileName()).getFileName().toString();
+    try {
+      DocumentContents document = loadDocument(ebookPart, uploadedFileName);
+
+      List<ChapterContent> chapters = splitIntoChapters(document.getFullText());
+      if (chapters.isEmpty()) {
+        forwardWithError(request, response, "Không tìm thấy nội dung chương hợp lệ trong tài liệu.");
+        return;
+      }
+
+      Path audioDirectory = resolveAudioOutputDirectory();
+      getServletContext().setAttribute("audioOutputDirectory", audioDirectory);
+      List<ChapterResult> chapterResults = new ArrayList<>();
+      List<AudioDownloadItem> downloadItems = new ArrayList<>();
+
+      for (ChapterContent chapter : chapters) {
+        String summary = summarizeTextWithOllama(chapter.getTitle(), chapter.getBody(), document.getLanguage());
+        Path audioFile = generateAudioWithIflytek(chapter.getTitle(), summary, audioDirectory);
+        String storedFileName = audioFile.getFileName().toString();
+        chapterResults.add(new ChapterResult(chapter.getTitle(), summary, storedFileName));
+        downloadItems.add(new AudioDownloadItem(storedFileName, chapter.getTitle()));
+      }
+
+      EbookMetadata metadata = document.getMetadata();
+      request.setAttribute("metadata", metadata);
+      request.setAttribute("chapters", chapterResults);
+      request.setAttribute("uploadedFileName", uploadedFileName);
+      HttpSession session = request.getSession(true);
+      session.setAttribute("audioDownloadItems", downloadItems);
+      session.setAttribute("audioDownloadBookTitle", resolveDownloadBookTitle(metadata, uploadedFileName));
+
+      request.getRequestDispatcher("/results.jsp").forward(request, response);
+    } catch (IllegalStateException ex) {
+      forwardWithError(request, response, ex.getMessage());
+    } catch (Exception ex) {
+      ex.printStackTrace();
+      forwardWithError(request, response, "Có lỗi xảy ra khi xử lý tài liệu: " + ex.getMessage());
+    }
+  }
+
+  private String extractFileExtension(String fileName) {
+    if (fileName == null) {
+      return "";
+    }
+    int dotIndex = fileName.lastIndexOf('.');
+    if (dotIndex < 0 || dotIndex >= fileName.length() - 1) {
+      return "";
+    }
+    return fileName.substring(dotIndex + 1).toLowerCase(Locale.ROOT);
   }
 
   private DocumentContents loadDocument(Part ebookPart, String uploadedFileName) throws IOException {
@@ -149,58 +227,6 @@ public class EbookProcessorServlet extends HttpServlet {
       }
     }
     throw new IllegalStateException("Định dạng tệp không được hỗ trợ. Vui lòng tải lên PDF hoặc DOCX.");
-  }
-
-  private String extractFileExtension(String fileName) {
-    if (fileName == null) {
-      return "";
-    }
-    int dotIndex = fileName.lastIndexOf('.');
-    if (dotIndex < 0 || dotIndex >= fileName.length() - 1) {
-      return "";
-    }
-    return fileName.substring(dotIndex + 1).toLowerCase(Locale.ROOT);
-  }
-
-  @Override
-  protected void doPost(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
-    Part ebookPart = request.getPart("ebook");
-    if (ebookPart == null || ebookPart.getSize() == 0) {
-      forwardWithError(request, response, "Vui lòng chọn một tệp PDF hoặc DOCX để tải lên.");
-      return;
-    }
-
-    String uploadedFileName = Paths.get(ebookPart.getSubmittedFileName()).getFileName().toString();
-    try {
-      DocumentContents document = loadDocument(ebookPart, uploadedFileName);
-
-      List<ChapterContent> chapters = splitIntoChapters(document.getFullText());
-      if (chapters.isEmpty()) {
-        forwardWithError(request, response, "Không tìm thấy nội dung chương hợp lệ trong tài liệu.");
-        return;
-      }
-
-      Path audioDirectory = resolveAudioOutputDirectory();
-      getServletContext().setAttribute("audioOutputDirectory", audioDirectory);
-      List<ChapterResult> chapterResults = new ArrayList<>();
-
-      for (ChapterContent chapter : chapters) {
-        String summary = summarizeTextWithGemini(chapter.getTitle(), chapter.getBody(), document.getLanguage());
-        Path audioFile = generateAudioWithIflytek(chapter.getTitle(), summary, audioDirectory);
-        chapterResults.add(new ChapterResult(chapter.getTitle(), summary, audioFile.getFileName().toString()));
-      }
-
-      request.setAttribute("metadata", document.getMetadata());
-      request.setAttribute("chapters", chapterResults);
-      request.setAttribute("uploadedFileName", uploadedFileName);
-
-      request.getRequestDispatcher("/results.jsp").forward(request, response);
-    } catch (IllegalStateException ex) {
-      forwardWithError(request, response, ex.getMessage());
-    } catch (Exception ex) {
-      ex.printStackTrace();
-      forwardWithError(request, response, "Có lỗi xảy ra khi xử lý tài liệu: " + ex.getMessage());
-    }
   }
 
   private EbookMetadata extractPdfMetadata(PDDocument document, String uploadedFileName, String fullText) {
@@ -522,6 +548,236 @@ public class EbookProcessorServlet extends HttpServlet {
       throw new IllegalStateException("Gemini API không trả về nội dung tóm tắt.");
     }
     return summary.trim();
+  }
+
+  private String summarizeTextWithOllama(String chapterTitle, String chapterText, DocumentLanguage language) {
+    // Build a prompt similar to the Gemini prompt but tailored for Ollama-powered
+    // chat models.
+    String system = "You are an instructor helping learners study independently. Create a detailed summary for the chapter below.";
+    String userPrompt = buildGeminiPrompt(language, chapterTitle, chapterText);
+    system = stripUnsupportedControlChars(system);
+    userPrompt = stripUnsupportedControlChars(userPrompt);
+
+    try {
+      // Use resolver helpers so configuration can come from env or system properties
+      String apiKey = resolveOllamaApiKey();
+      String host = resolveOllamaHost();
+      String model = resolveOllamaModel();
+
+      JsonObject requestBody = new JsonObject();
+      requestBody.addProperty("model", model);
+      JsonArray messages = new JsonArray();
+
+      JsonObject systemMessage = new JsonObject();
+      systemMessage.addProperty("role", "system");
+      systemMessage.addProperty("content", system);
+      messages.add(systemMessage);
+
+      JsonObject userMessage = new JsonObject();
+      userMessage.addProperty("role", "user");
+      userMessage.addProperty("content", userPrompt);
+      messages.add(userMessage);
+
+      requestBody.add("messages", messages);
+      requestBody.addProperty("stream", false);
+
+      String requestJson = GSON.toJson(requestBody);
+
+      java.net.http.HttpRequest.Builder reqBuilder = java.net.http.HttpRequest.newBuilder()
+          .uri(URI.create(host + "/api/chat"))
+          .timeout(Duration.ofSeconds(60))
+          .header("Content-Type", "application/json")
+          .header("Accept", "application/json")
+          .POST(java.net.http.HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8));
+
+      if (apiKey != null && !apiKey.isBlank()) {
+        reqBuilder.header("Authorization", "Bearer " + apiKey.trim());
+      }
+
+      java.net.http.HttpRequest req = reqBuilder.build();
+
+      java.net.http.HttpResponse<String> resp = httpClient.send(req,
+          HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+      if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
+        String body = resp.body();
+        try {
+          JsonObject root = JsonParser.parseString(body).getAsJsonObject();
+          String extracted = extractOllamaResponse(root);
+          if (extracted != null && !extracted.isBlank()) {
+            return extracted.trim();
+          }
+        } catch (Exception ex) {
+          if (body != null && !body.isBlank()) {
+            return body.trim();
+          }
+        }
+      } else if (resp.statusCode() == 401 || resp.statusCode() == 403) {
+        throw new IllegalStateException("Không thể xác thực với Ollama host (HTTP " + resp.statusCode() + ")");
+      } else {
+        throw new IllegalStateException("Ollama API trả về HTTP " + resp.statusCode() + ": " + resp.body());
+      }
+    } catch (IOException | InterruptedException ex) {
+      throw new IllegalStateException("Không thể gọi Ollama API để tóm tắt: " + ex.getMessage(), ex);
+    }
+
+    throw new IllegalStateException("Ollama API không trả về phần tóm tắt hợp lệ.");
+  }
+
+  private String extractOllamaResponse(JsonObject root) {
+    if (root == null) {
+      return null;
+    }
+
+    if (root.has("output") && root.get("output").isJsonArray()) {
+      for (var elem : root.getAsJsonArray("output")) {
+        if (!elem.isJsonObject()) {
+          continue;
+        }
+        JsonObject obj = elem.getAsJsonObject();
+        String viaContent = extractContentParts(obj.get("content"));
+        if (viaContent != null && !viaContent.isBlank()) {
+          return viaContent;
+        }
+        String viaMessage = extractContentParts(obj.get("message"));
+        if (viaMessage != null && !viaMessage.isBlank()) {
+          return viaMessage;
+        }
+      }
+    }
+
+    if (root.has("choices") && root.get("choices").isJsonArray()) {
+      for (var choice : root.getAsJsonArray("choices")) {
+        if (!choice.isJsonObject()) {
+          continue;
+        }
+        JsonObject co = choice.getAsJsonObject();
+        String viaMessage = extractContentParts(co.get("message"));
+        if (viaMessage != null && !viaMessage.isBlank()) {
+          return viaMessage;
+        }
+      }
+    }
+
+    if (root.has("message")) {
+      String viaMessage = extractContentParts(root.get("message"));
+      if (viaMessage != null && !viaMessage.isBlank()) {
+        return viaMessage;
+      }
+    }
+
+    if (root.has("response") && root.get("response").isJsonPrimitive()) {
+      return root.get("response").getAsString();
+    }
+
+    if (root.has("output_text") && root.get("output_text").isJsonPrimitive()) {
+      return root.get("output_text").getAsString();
+    }
+
+    if (root.has("content") && root.get("content").isJsonPrimitive()) {
+      return root.get("content").getAsString();
+    }
+
+    return null;
+  }
+
+  private String extractContentParts(com.google.gson.JsonElement element) {
+    if (element == null || element.isJsonNull()) {
+      return null;
+    }
+
+    if (element.isJsonPrimitive()) {
+      return element.getAsString();
+    }
+
+    if (!element.isJsonObject()) {
+      return null;
+    }
+
+    JsonObject obj = element.getAsJsonObject();
+    if (obj.has("content") && obj.get("content").isJsonPrimitive()) {
+      return obj.get("content").getAsString();
+    }
+
+    if (obj.has("parts") && obj.get("parts").isJsonArray()) {
+      StringBuilder sb = new StringBuilder();
+      obj.getAsJsonArray("parts").forEach(p -> sb.append(p.getAsString()));
+      return sb.toString();
+    }
+
+    if (obj.has("message")) {
+      return extractContentParts(obj.get("message"));
+    }
+
+    if (obj.has("content") && obj.get("content").isJsonObject()) {
+      return extractContentParts(obj.get("content"));
+    }
+
+    return null;
+  }
+
+  private String stripUnsupportedControlChars(String input) {
+    if (input == null || input.isEmpty()) {
+      return "";
+    }
+    StringBuilder sb = new StringBuilder(input.length());
+    for (int i = 0; i < input.length(); i++) {
+      char c = input.charAt(i);
+      if (c >= 0x20 || c == '\n' || c == '\r' || c == '\t') {
+        sb.append(c);
+      }
+    }
+    return sb.toString();
+  }
+
+  // Ollama config resolvers - read from environment variables or system
+  // properties.
+  private String resolveOllamaApiKey() {
+    String v = System.getenv("OLLAMA_API_KEY");
+    if (v == null || v.isBlank()) {
+      v = System.getProperty("ollama.api.key");
+    }
+    if (v == null || v.isBlank()) {
+      return null;
+    }
+    return v.trim();
+  }
+
+  private String resolveOllamaHost() {
+    String v = System.getenv("OLLAMA_HOST");
+    if (v == null || v.isBlank()) {
+      v = System.getProperty("ollama.host");
+    }
+    String apiKey = resolveOllamaApiKey();
+    if (v == null || v.isBlank()) {
+      return (apiKey != null && !apiKey.isBlank()) ? OLLAMA_DEFAULT_CLOUD_HOST : OLLAMA_DEFAULT_LOCAL_HOST;
+    }
+    return v.trim();
+  }
+
+  private String resolveOllamaModel() {
+    String v = System.getenv("OLLAMA_MODEL");
+    if (v == null || v.isBlank()) {
+      v = System.getProperty("ollama.model");
+    }
+    String apiKey = resolveOllamaApiKey();
+    if (v == null || v.isBlank()) {
+      return (apiKey != null && !apiKey.isBlank()) ? OLLAMA_DEFAULT_CLOUD_MODEL : OLLAMA_DEFAULT_LOCAL_MODEL;
+    }
+    return v.trim();
+  }
+
+  private String resolveDownloadBookTitle(EbookMetadata metadata, String uploadedFileName) {
+    String candidate = metadata != null ? safeTrim(metadata.getTitle()) : null;
+    if (candidate != null && candidate.equalsIgnoreCase("không rõ")) {
+      candidate = null;
+    }
+    if (candidate == null || candidate.isBlank()) {
+      candidate = humanizeFilenameStem(extractBaseName(uploadedFileName));
+    }
+    if (candidate == null || candidate.isBlank()) {
+      candidate = "ebook";
+    }
+    return candidate;
   }
 
   private void configureZipSecureFileLimits() {

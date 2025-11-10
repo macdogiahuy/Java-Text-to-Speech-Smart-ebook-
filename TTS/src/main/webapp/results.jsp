@@ -99,6 +99,7 @@
 
     <div class="actions">
         <a href="${pageContext.request.contextPath}/index.jsp">Tải lên ebook khác</a>
+        <a href="<%= response.encodeURL(request.getContextPath() + "/download-audio-zip") %>" class="secondary">Tải toàn bộ audio</a>
     </div>
 </div>
 </body>
