@@ -1,107 +1,126 @@
-## Ebook Text-to-Speech Pipeline
+## Ebook Text-to-Speech (TTS) — Smart eBook Processor
 
-This project is a Jakarta EE web application that:
+This is a Jakarta EE web application that converts an uploaded PDF or DOCX ebook into
+chapter summaries and audio. It performs the following tasks:
 
-- Uploads a PDF ebook and extracts full text with Apache PDFBox
-- Summarises chapters with Google Gemini models
-- Synthesises chapter summaries through iFLYTEK streaming TTS
-- Serves the generated audio files for download or streaming
+- Extracts text and metadata from a PDF/DOCX using Apache PDFBox / Apache POI
+- Splits the text into chapters (heuristic headings)
+- Summarizes each chapter using an LLM (Google Gemini by default or Ollama)
+- Generates spoken audio for each chapter summary using iFLYTEK TTS (streaming WebSocket)
+- Presents results in a web UI and allows downloading all chapter audio as a single zip
 
-### 1. Prerequisites
+This README documents how to configure, run, and troubleshoot the project.
 
-- JDK 21+
-- Apache Maven 3.9+
-- Access to Google Gemini API
-- Access to iFLYTEK Online TTS (stream) service
-- Git (for version control)
+---
 
-### 2. Configure Secrets
+### Prerequisites
 
-All sensitive credentials are pulled from environment variables or JVM system properties.
+- Java 17+ (project compiled/tested with modern JDKs — use JDK 21 when possible)
+- Apache Maven 3.6+ (3.8+/3.9+ recommended)
+- Servlet container compatible with Jakarta EE (Tomcat 10, Payara, GlassFish 7, etc.)
+- Optional services / accounts:
+  - Google Gemini API access (or other LLM)
+  - iFLYTEK TTS cloud credentials (for high-quality audio)
+  - Ollama (local or cloud) if you prefer using Ollama models
 
-| Purpose               | Environment variable                 | JVM property                         |
-| --------------------- | ------------------------------------ | ------------------------------------ |
-| Google Gemini API key | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | `google.api.key` or `gemini.api.key` |
-| iFLYTEK App ID        | `IFLYTEK_APP_ID`                     | `iflytek.app.id`                     |
-| iFLYTEK API Key       | `IFLYTEK_API_KEY`                    | `iflytek.api.key`                    |
-| iFLYTEK API Secret    | `IFLYTEK_API_SECRET`                 | `iflytek.api.secret`                 |
+---
 
-Optional overrides (if not set, sane defaults are used):
+### Environment configuration
 
-- `IFLYTEK_TTS_ENDPOINT` (`iflytek.tts.endpoint`) – defaults to `wss://tts-api-sg.xf-yun.com/v2/tts`
-- `IFLYTEK_TTS_VOICE` (`iflytek.tts.voice`) – defaults to `xiaoyun`
-- `IFLYTEK_TTS_AUE`, `IFLYTEK_TTS_AUF`, `IFLYTEK_TTS_TTE`
-- `IFLYTEK_TTS_SPEED`, `IFLYTEK_TTS_VOLUME`, `IFLYTEK_TTS_PITCH`, `IFLYTEK_TTS_BGS`, `IFLYTEK_TTS_REG`, `IFLYTEK_TTS_RDN`
+The app reads credentials and options from environment variables or JVM system properties. Environment variables are preferred.
 
-> **Tip:** Use a `.env` file or application server config for local development, and a secrets manager in production.
+Core variables:
 
-### 3. Build & Run
+- GOOGLE_API_KEY or GEMINI_API_KEY (Gemini)
+- IFLYTEK_APP_ID
+- IFLYTEK_API_KEY
+- IFLYTEK_API_SECRET
 
-```bash
+Ollama (optional, for local or cloud Ollama models):
+
+- OLLAMA_API_KEY (when using ollama.com cloud API)
+- OLLAMA_HOST (set to https://ollama.com to target cloud API; otherwise uses http://localhost:11434)
+- OLLAMA_MODEL (defaults to a sensible cloud/local model depending on OLLAMA_API_KEY presence)
+
+IFLYTEK optional overrides and tunables (also available as system properties under `iflytek.*`):
+
+- IFLYTEK_TTS_ENDPOINT (default: wss://tts-api-sg.xf-yun.com/v2/tts)
+- IFLYTEK_TTS_VOICE (default: xiaoyun)
+- IFLYTEK_TTS_AUE / IFLYTEK_TTS_AUF / IFLYTEK_TTS_TTE
+- IFLYTEK_TTS_SPEED / IFLYTEK_TTS_VOLUME / IFLYTEK_TTS_PITCH
+
+Other useful environment flags:
+
+- TTS_PREVIEW_ONLY=true to use a local preview/synth (no external API calls)
+
+---
+
+### Build
+
+From the repository root:
+
+```powershell
+mvn clean package -DskipTests
+```
+
+This produces `target/TTS-1.0-SNAPSHOT.war`.
+
+---
+
+### Deploy
+
+Deploy the WAR to Tomcat 10 / Payara / GlassFish. When running locally from your IDE, ensure the runtime provides the Jakarta Servlet 5 API.
+
+---
+
+### Usage
+
+1. Open the app root (e.g., `http://localhost:8080/TTS/`) and go to `index.jsp`.
+2. Upload a PDF or DOCX file.
+3. The server will parse the file, detect chapters, summarize each chapter with the configured LLM, and generate TTS audio with iFLYTEK.
+4. The results page lists chapter titles, summaries, and a download button to get all chapter audio as a single ZIP.
+
+Download naming behaviour:
+
+- The zip filename is derived from the ebook title metadata (falls back to the uploaded filename stem) and looks like: `<book>-audio.zip`.
+- Inside the zip, audio files are ordered and named as `01-chapter-title.mp3`, with diacritics removed and unsafe characters replaced, so users can easily find chapters by number + title.
+
+---
+
+### Troubleshooting
+
+- If you see HTTP 400 from Ollama complaining about invalid characters, ensure the app is running a version that sanitizes control characters. Prompts containing binary/control characters can break JSON encoding.
+- If the download ZIP contains unexpected files, ensure you are using the app `Download` button (it zips only generated chapter audio stored in the session). Files under `target/` or other app directories are not included.
+- For iFLYTEK HMAC errors, make sure your system clock is correct and credentials are valid.
+
+Logs and debugging:
+
+- Check your servlet container logs for stack traces printed by the servlet.
+- For Ollama API responses, the servlet will raise descriptive errors (HTTP code + body) when the remote host returns unexpected data.
+
+---
+
+### Example: run locally with environment variables (PowerShell)
+
+```powershell
+$env:GOOGLE_API_KEY = 'your_key_here'
+$env:IFLYTEK_APP_ID = 'your_app_id'
+$env:IFLYTEK_API_KEY = 'your_iflytek_key'
+$env:IFLYTEK_API_SECRET = 'your_iflytek_secret'
 mvn clean package
 ```
 
-This produces `target/TTS-1.0-SNAPSHOT.war`. Deploy the WAR to a compatible servlet container (e.g. Payara, Tomcat 10, GlassFish 7).
+Then deploy the WAR to your container.
 
-For rapid local testing you can also use Maven’s built-in Jetty/Tomcat plugins or run from your IDE.
+---
 
-### 4. Usage Flow
+### Development notes
 
-1. Visit `/index.jsp`
-2. Upload a PDF ebook
-3. The server extracts metadata, splits chapters, and generates Gemini summaries
-4. Summaries are sent to iFLYTEK TTS via WebSocket; audio files are saved under `test-audio-output/`
-5. The results page lists chapter summaries alongside download links for the generated audio
+- Generated audio is written to an `test-audio-output` directory in the project working directory for easy inspection.
+- The servlet stores a lightweight list of `AudioDownloadItem` objects in the user session when audio is created; the ZIP generator reads only those entries for packaging.
 
-### 5. Troubleshooting
+---
 
-- **403 HMAC signature errors** – ensure system clock is within ±5 minutes of UTC, credentials are valid, and the selected voice is enabled in the iFLYTEK console.
-- **IP whitelist errors** – configure the correct public IP in iFLYTEK console or disable the whitelist.
-- **Large PDFs** – the Gemini prompt clips source text to 6000 characters per chapter; adjust `MAX_SUMMARY_SOURCE_CHARACTERS` if needed.
+### Contributing, License
 
-### 6. Git Hygiene
-
-Secrets must never be committed. Verify with:
-
-```bash
-git status
-git diff
-```
-
-Before pushing, inspect `pom.xml`, `src/main/java/.../EbookProcessorServlet.java`, and config files to ensure they only contain placeholders for credentials.
-
-### 7. Push to GitHub
-
-1. Authenticate with GitHub (`gh auth login` or Git credentials)
-2. Add all relevant files:
-   ```bash
-   git add .
-   ```
-3. Review pending changes:
-   ```bash
-   git status
-   git diff --cached
-   ```
-4. Commit:
-   ```bash
-   git commit -m "Refactor secrets handling and update docs"
-   ```
-5. Push to your remote:
-   ```bash
-   git push origin <your-branch>
-   ```
-
-> Make sure that `.gitignore` covers local build outputs and secret files (.env). Add entries if necessary before committing.
-
-### 8. Security Checklist
-
-- Rotate API keys immediately if a secret was previously committed.
-- Limit permissions of each API key to the minimum required.
-- Store production secrets outside the codebase (cloud secret manager, CI/CD vault, etc.).
-- Monitor usage quotas on Gemini and iFLYTEK consoles.
-
-### 9. License & Contributions
-
-Update this section with your project’s licence and contribution guidelines.
-
-This project is released under the [MIT License](LICENSE).
+Contributions welcome. The project is licensed under the MIT License (see `LICENSE`).
