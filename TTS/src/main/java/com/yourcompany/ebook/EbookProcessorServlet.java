@@ -26,12 +26,15 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Calendar;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -54,6 +57,7 @@ import com.google.genai.Client;
 import com.google.genai.types.GenerateContentResponse;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
@@ -73,13 +77,13 @@ public class EbookProcessorServlet extends HttpServlet {
   private static final long serialVersionUID = 1L;
 
   // TODO: Replace placeholders with actual keys before production deploy.
-  private static final String GEMINI_API_KEY = "Your-Gemini-API-Key"; // Set via secure configbefore
-                                                                      // deployment
+  private static final String GEMINI_API_KEY = "AIzaSyDhqpdjSISltQ1tZk7ej7oXc54yfs2UNhA"; // Set via secure configbefore
+                                                                                          // deployment
   private static final String IFLYTEK_TTS_ENDPOINT = "wss://tts-api-sg.xf-yun.com/v2/tts";
   // TODO: Replace with secure configuration before deployment.
-  private static final String IFLYTEK_APP_ID = "Your-IFLYTEK-APP-ID";
-  private static final String IFLYTEK_API_KEY = "Your-IFLYTEK-API-KEY";
-  private static final String IFLYTEK_API_SECRET = "Your-IFLYTEK-API-SECRET";
+  private static final String IFLYTEK_APP_ID = "ga808480";
+  private static final String IFLYTEK_API_KEY = "d742d908cae15e294634326dcb3b48c2";
+  private static final String IFLYTEK_API_SECRET = "1ef679ae0116ef363d4b4b3c5f8d3a4b";
   private static final String IFLYTEK_DEFAULT_VOICE = "xiaoyun";
   private static final String IFLYTEK_DEFAULT_AUE = "lame";
   private static final String IFLYTEK_DEFAULT_TTE = "UTF8";
@@ -112,7 +116,7 @@ public class EbookProcessorServlet extends HttpServlet {
   // Ollama configuration defaults
   private static final String OLLAMA_DEFAULT_LOCAL_HOST = "http://localhost:11434";
   private static final String OLLAMA_DEFAULT_CLOUD_HOST = "https://ollama.com";
-  private static final String OLLAMA_DEFAULT_LOCAL_MODEL = "gpt-oss:20b";
+  private static final String OLLAMA_DEFAULT_LOCAL_MODEL = "gemma3:1b";
   private static final String OLLAMA_DEFAULT_CLOUD_MODEL = "gpt-oss:120b-cloud";
 
   private static final Pattern CHAPTER_HEADING_PATTERN = Pattern.compile(
@@ -122,6 +126,13 @@ public class EbookProcessorServlet extends HttpServlet {
           "(?im)^\\s*(?:tác giả|tac gia|author|biên soạn|bien soan|chủ biên|chu bien)\\s*[:：]\\s*([^\\n\\r]+)"),
       Pattern.compile("(?im)^\\s*(?:nhóm biên soạn|group author|soạn giả)\\s*[:：]\\s*([^\\n\\r]+)"),
       Pattern.compile("(?im)\\b(?:by|edited by|compiled by)\\s+([\\p{L}0-9 .,'-]{3,})") };
+  private static final int QUESTION_BANK_TARGET_COUNT = 150;
+  private static final int QUESTION_BANK_MIN_OPTIONS = 4;
+  private static final int QUESTION_BANK_MAX_CONTEXT_CHARS = 18_000;
+  private static final double QUESTION_BANK_EASY_RATIO = 0.34d;
+  private static final double QUESTION_BANK_HARD_RATIO = 0.22d;
+  private static final DateTimeFormatter QUESTION_BANK_FILENAME_FORMATTER = DateTimeFormatter
+      .ofPattern("yyyyMMdd-HHmmss", Locale.US);
 
   private transient volatile Client geminiClient;
   private transient volatile boolean localPreviewOverride;
@@ -131,8 +142,8 @@ public class EbookProcessorServlet extends HttpServlet {
       .version(HttpClient.Version.HTTP_1_1)
       .connectTimeout(Duration.ofSeconds(30))
       .build();
-
   private static final Gson GSON = new Gson();
+  private static final String SESSION_ATTR_DOCUMENT_CONTEXT = "uploadedDocumentContext";
 
   @Override
   protected void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
@@ -141,11 +152,27 @@ public class EbookProcessorServlet extends HttpServlet {
 
   @Override
   protected void doPost(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
-    Part ebookPart = null;
+    String action = request.getParameter("action");
+    if (action == null || action.isBlank()) {
+      action = "process-audio";
+    }
+
+    if ("generate-audio".equalsIgnoreCase(action)) {
+      try {
+        handleGenerateAudioRequest(request, response);
+      } catch (IllegalStateException ex) {
+        forwardWithError(request, response, ex.getMessage());
+      } catch (InterruptedException ex) {
+        Thread.currentThread().interrupt();
+        forwardWithError(request, response, "Có lỗi xảy ra khi tạo audio: " + ex.getMessage());
+      }
+      return;
+    }
+
+    Part ebookPart;
     try {
       ebookPart = request.getPart("ebook");
     } catch (IllegalStateException ex) {
-      // file too large or multipart error
       forwardWithError(request, response, "Tệp tải lên quá lớn hoặc yêu cầu multipart không hợp lệ.");
       return;
     }
@@ -156,6 +183,7 @@ public class EbookProcessorServlet extends HttpServlet {
     }
 
     String uploadedFileName = Paths.get(ebookPart.getSubmittedFileName()).getFileName().toString();
+
     try {
       DocumentContents document = loadDocument(ebookPart, uploadedFileName);
 
@@ -165,32 +193,26 @@ public class EbookProcessorServlet extends HttpServlet {
         return;
       }
 
-      Path audioDirectory = resolveAudioOutputDirectory();
-      getServletContext().setAttribute("audioOutputDirectory", audioDirectory);
-      List<ChapterResult> chapterResults = new ArrayList<>();
-      List<AudioDownloadItem> downloadItems = new ArrayList<>();
-
-      for (ChapterContent chapter : chapters) {
-        String summary = summarizeTextWithOllama(chapter.getTitle(), chapter.getBody(), document.getLanguage());
-        Path audioFile = generateAudioWithIflytek(chapter.getTitle(), summary, audioDirectory);
-        String storedFileName = audioFile.getFileName().toString();
-        chapterResults.add(new ChapterResult(chapter.getTitle(), summary, storedFileName));
-        downloadItems.add(new AudioDownloadItem(storedFileName, chapter.getTitle()));
+      if ("generate-question-bank".equalsIgnoreCase(action)) {
+        handleQuestionBankResponse(request, response, document, chapters, uploadedFileName);
+        return;
       }
 
-      EbookMetadata metadata = document.getMetadata();
-      request.setAttribute("metadata", metadata);
-      request.setAttribute("chapters", chapterResults);
-      request.setAttribute("uploadedFileName", uploadedFileName);
+      // Tóm tắt các chương và hiển thị danh sách để người dùng chọn
+      DocumentContext context = prepareDocumentContext(uploadedFileName, document, chapters);
       HttpSession session = request.getSession(true);
-      session.setAttribute("audioDownloadItems", downloadItems);
-      session.setAttribute("audioDownloadBookTitle", resolveDownloadBookTitle(metadata, uploadedFileName));
+      session.setAttribute(SESSION_ATTR_DOCUMENT_CONTEXT, context);
 
-      request.getRequestDispatcher("/results.jsp").forward(request, response);
+      request.setAttribute("metadata", context.getMetadata());
+      request.setAttribute("chapters", context.getChapters());
+      request.setAttribute("uploadedFileName", uploadedFileName);
+      request.setAttribute("isStructuredDocument", context.isStructured());
+
+      request.getRequestDispatcher("/chapters.jsp").forward(request, response);
     } catch (IllegalStateException ex) {
       forwardWithError(request, response, ex.getMessage());
-    } catch (Exception ex) {
-      ex.printStackTrace();
+    } catch (InterruptedException ex) {
+      Thread.currentThread().interrupt();
       forwardWithError(request, response, "Có lỗi xảy ra khi xử lý tài liệu: " + ex.getMessage());
     }
   }
@@ -434,16 +456,18 @@ public class EbookProcessorServlet extends HttpServlet {
     Matcher matcher = CHAPTER_HEADING_PATTERN.matcher(rawText);
     List<Integer> chapterStartPositions = new ArrayList<>();
     List<String> chapterTitles = new ArrayList<>();
+    List<String> rawHeadings = new ArrayList<>();
 
     while (matcher.find()) {
       chapterStartPositions.add(matcher.start());
-      String heading = matcher.group().trim();
+      String heading = matcher.group();
+      rawHeadings.add(heading);
       chapterTitles.add(sanitizeHeading(heading));
     }
 
     if (chapterStartPositions.isEmpty()) {
       // No explicit chapter headings detected, treat entire text as one chapter.
-      chapters.add(new ChapterContent("Toàn bộ sách", rawText.trim()));
+      chapters.add(new ChapterContent("Toàn bộ sách", rawText.trim(), 0, null));
       return chapters;
     }
 
@@ -453,10 +477,11 @@ public class EbookProcessorServlet extends HttpServlet {
       int start = chapterStartPositions.get(i);
       int end = chapterStartPositions.get(i + 1);
       String body = rawText.substring(start, end).trim();
-      chapters.add(new ChapterContent(chapterTitles.get(i), body));
+      Integer sequence = extractChapterSequence(rawHeadings.get(i));
+      chapters.add(new ChapterContent(chapterTitles.get(i), body, start, sequence));
     }
 
-    return chapters;
+    return deduplicateAndOrderChapters(chapters);
   }
 
   private String sanitizeHeading(String heading) {
@@ -466,6 +491,127 @@ public class EbookProcessorServlet extends HttpServlet {
       clean = clean.substring(0, 80) + "...";
     }
     return clean;
+  }
+
+  private Integer extractChapterSequence(String heading) {
+    if (heading == null) {
+      return null;
+    }
+    String normalized = heading.trim();
+    if (normalized.isEmpty()) {
+      return null;
+    }
+
+    Pattern labeledArabic = Pattern.compile(
+        "(?i)(?:chapter|chương|chapitre|ch\\.?|section|unit|lesson|bài)\\s*(?:[:\\-\\.\\u2013]\\s*)*(\\d{1,4})");
+    Matcher arabicMatcher = labeledArabic.matcher(normalized);
+    if (arabicMatcher.find()) {
+      return parseSafeInt(arabicMatcher.group(1));
+    }
+
+    Pattern labeledRoman = Pattern.compile(
+        "(?i)(?:chapter|chương|chapitre|ch\\.?|section|unit|lesson|bài)\\s*(?:[:\\-\\.\\u2013]\\s*)*([ivxlcdm]{1,10})");
+    Matcher romanMatcher = labeledRoman.matcher(normalized);
+    if (romanMatcher.find()) {
+      Integer value = romanToInt(romanMatcher.group(1));
+      if (value != null) {
+        return value;
+      }
+    }
+
+    Pattern leadingDigits = Pattern.compile("^(\\d{1,4})");
+    Matcher leadingMatcher = leadingDigits.matcher(normalized);
+    if (leadingMatcher.find()) {
+      return parseSafeInt(leadingMatcher.group(1));
+    }
+
+    Pattern anyDigits = Pattern.compile("(\\d{1,4})");
+    Matcher anyDigitMatcher = anyDigits.matcher(normalized);
+    if (anyDigitMatcher.find()) {
+      return parseSafeInt(anyDigitMatcher.group(1));
+    }
+
+    Pattern romanAnywhere = Pattern.compile("(?i)\\b([ivxlcdm]{1,10})\\b");
+    Matcher romanAnywhereMatcher = romanAnywhere.matcher(normalized);
+    if (romanAnywhereMatcher.find()) {
+      return romanToInt(romanAnywhereMatcher.group(1));
+    }
+
+    return null;
+  }
+
+  private Integer parseSafeInt(String digits) {
+    try {
+      return Integer.parseInt(digits);
+    } catch (NumberFormatException ex) {
+      return null;
+    }
+  }
+
+  private Integer romanToInt(String roman) {
+    if (roman == null || roman.isBlank()) {
+      return null;
+    }
+    String upper = roman.toUpperCase(Locale.ROOT);
+    int total = 0;
+    int previous = 0;
+    for (int i = upper.length() - 1; i >= 0; i--) {
+      int value = romanCharValue(upper.charAt(i));
+      if (value == 0) {
+        return null;
+      }
+      if (value < previous) {
+        total -= value;
+      } else {
+        total += value;
+        previous = value;
+      }
+    }
+    return total > 0 ? total : null;
+  }
+
+  private int romanCharValue(char c) {
+    switch (c) {
+      case 'I':
+        return 1;
+      case 'V':
+        return 5;
+      case 'X':
+        return 10;
+      case 'L':
+        return 50;
+      case 'C':
+        return 100;
+      case 'D':
+        return 500;
+      case 'M':
+        return 1000;
+      default:
+        return 0;
+    }
+  }
+
+  private List<ChapterContent> deduplicateAndOrderChapters(List<ChapterContent> input) {
+    if (input.size() < 2) {
+      return input;
+    }
+
+    Set<Integer> seenSequences = new HashSet<>();
+    List<ChapterContent> filtered = new ArrayList<>(input.size());
+
+    for (int i = input.size() - 1; i >= 0; i--) {
+      ChapterContent chapter = input.get(i);
+      Integer sequence = chapter.getSequence();
+      if (sequence != null) {
+        if (!seenSequences.add(sequence)) {
+          continue;
+        }
+      }
+      filtered.add(chapter);
+    }
+
+    filtered.sort((a, b) -> Integer.compare(a.getStartOffset(), b.getStartOffset()));
+    return filtered;
   }
 
   private DocumentLanguage detectDocumentLanguage(String text) {
@@ -505,6 +651,7 @@ public class EbookProcessorServlet extends HttpServlet {
     return DocumentLanguage.ENGLISH;
   }
 
+  @SuppressWarnings("unused")
   private String summarizeTextWithGemini(String chapterTitle, String chapterText, DocumentLanguage language) {
     ensureGeminiConfigured();
 
@@ -555,50 +702,101 @@ public class EbookProcessorServlet extends HttpServlet {
     // chat models.
     String system = "You are an instructor helping learners study independently. Create a detailed summary for the chapter below.";
     String userPrompt = buildGeminiPrompt(language, chapterTitle, chapterText);
-    system = stripUnsupportedControlChars(system);
-    userPrompt = stripUnsupportedControlChars(userPrompt);
+    try {
+      String response = callOllamaChat(system, userPrompt, Duration.ofSeconds(75));
+      if (response == null || response.isBlank()) {
+        throw new IllegalStateException("Ollama API không trả về phần tóm tắt hợp lệ.");
+      }
+      return response.trim();
+    } catch (OllamaRateLimitException rateLimit) {
+      // Fallback to Gemini when Ollama cloud hits rate limits or local fallback
+      // fails.
+      return summarizeTextWithGemini(chapterTitle, chapterText, language);
+    }
+  }
+
+  private String callOllamaChat(String systemPrompt, String userPrompt, Duration timeout)
+      throws IllegalStateException {
+    String system = stripUnsupportedControlChars(systemPrompt);
+    String user = stripUnsupportedControlChars(userPrompt);
+
+    String apiKey = resolveOllamaApiKey();
+    String host = resolveOllamaHost();
+    String model = resolveOllamaModel();
 
     try {
-      // Use resolver helpers so configuration can come from env or system properties
-      String apiKey = resolveOllamaApiKey();
-      String host = resolveOllamaHost();
-      String model = resolveOllamaModel();
-
-      JsonObject requestBody = new JsonObject();
-      requestBody.addProperty("model", model);
-      JsonArray messages = new JsonArray();
-
-      JsonObject systemMessage = new JsonObject();
-      systemMessage.addProperty("role", "system");
-      systemMessage.addProperty("content", system);
-      messages.add(systemMessage);
-
-      JsonObject userMessage = new JsonObject();
-      userMessage.addProperty("role", "user");
-      userMessage.addProperty("content", userPrompt);
-      messages.add(userMessage);
-
-      requestBody.add("messages", messages);
-      requestBody.addProperty("stream", false);
-
-      String requestJson = GSON.toJson(requestBody);
-
-      java.net.http.HttpRequest.Builder reqBuilder = java.net.http.HttpRequest.newBuilder()
-          .uri(URI.create(host + "/api/chat"))
-          .timeout(Duration.ofSeconds(60))
-          .header("Content-Type", "application/json")
-          .header("Accept", "application/json")
-          .POST(java.net.http.HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8));
-
-      if (apiKey != null && !apiKey.isBlank()) {
-        reqBuilder.header("Authorization", "Bearer " + apiKey.trim());
+      return executeOllamaChatRequest(system, user, timeout, host, model, apiKey);
+    } catch (OllamaRateLimitException rateLimit) {
+      if (isLikelyCloudHost(host, apiKey)) {
+        String localHost = resolveOllamaLocalHost();
+        if (!hostsEqual(localHost, host)) {
+          String localModel = resolveOllamaLocalModel(model);
+          try {
+            return executeOllamaChatRequest(system, user, timeout, localHost, localModel, null);
+          } catch (OllamaRateLimitException secondary) {
+            throw secondary;
+          } catch (IllegalStateException fallbackFailure) {
+            throw new IllegalStateException(
+                "Ollama cloud bị giới hạn và fallback local thất bại: " + fallbackFailure.getMessage(),
+                fallbackFailure);
+          }
+        }
       }
+      throw rateLimit;
+    }
+  }
 
-      java.net.http.HttpRequest req = reqBuilder.build();
+  private String executeOllamaChatRequest(String system, String user, Duration timeout, String host, String model,
+      String apiKey) {
+    if (host == null || host.isBlank()) {
+      throw new IllegalStateException("Chưa cấu hình Ollama host.");
+    }
+    if (model == null || model.isBlank()) {
+      throw new IllegalStateException("Chưa cấu hình Ollama model.");
+    }
 
+    JsonObject requestBody = new JsonObject();
+    requestBody.addProperty("model", model);
+    JsonArray messages = new JsonArray();
+
+    JsonObject systemMessage = new JsonObject();
+    systemMessage.addProperty("role", "system");
+    systemMessage.addProperty("content", system);
+    messages.add(systemMessage);
+
+    JsonObject userMessage = new JsonObject();
+    userMessage.addProperty("role", "user");
+    userMessage.addProperty("content", user);
+    messages.add(userMessage);
+
+    requestBody.add("messages", messages);
+    requestBody.addProperty("stream", false);
+
+    String requestJson = GSON.toJson(requestBody);
+    Duration effectiveTimeout = (timeout == null || timeout.isNegative() || timeout.isZero())
+        ? Duration.ofSeconds(60)
+        : timeout;
+
+    String endpoint = normalizeOllamaEndpoint(host);
+
+    java.net.http.HttpRequest.Builder reqBuilder = java.net.http.HttpRequest.newBuilder()
+        .uri(URI.create(endpoint))
+        .timeout(effectiveTimeout)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .POST(java.net.http.HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8));
+
+    if (apiKey != null && !apiKey.isBlank()) {
+      reqBuilder.header("Authorization", "Bearer " + apiKey.trim());
+    }
+
+    java.net.http.HttpRequest req = reqBuilder.build();
+
+    try {
       java.net.http.HttpResponse<String> resp = httpClient.send(req,
           HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-      if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
+      int status = resp.statusCode();
+      if (status >= 200 && status < 300) {
         String body = resp.body();
         try {
           JsonObject root = JsonParser.parseString(body).getAsJsonObject();
@@ -611,16 +809,801 @@ public class EbookProcessorServlet extends HttpServlet {
             return body.trim();
           }
         }
-      } else if (resp.statusCode() == 401 || resp.statusCode() == 403) {
-        throw new IllegalStateException("Không thể xác thực với Ollama host (HTTP " + resp.statusCode() + ")");
-      } else {
-        throw new IllegalStateException("Ollama API trả về HTTP " + resp.statusCode() + ": " + resp.body());
+        throw new IllegalStateException("Ollama API không trả về nội dung văn bản.");
       }
-    } catch (IOException | InterruptedException ex) {
-      throw new IllegalStateException("Không thể gọi Ollama API để tóm tắt: " + ex.getMessage(), ex);
+      if (status == 429) {
+        throw new OllamaRateLimitException(endpoint, resp.body());
+      }
+      if (status == 401 || status == 403) {
+        throw new IllegalStateException("Không thể xác thực với Ollama host (HTTP " + status + ")");
+      }
+      throw new IllegalStateException("Ollama API trả về HTTP " + status + ": " + resp.body());
+    } catch (InterruptedException ex) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("Yêu cầu Ollama bị gián đoạn: " + ex.getMessage(), ex);
+    } catch (IOException ex) {
+      throw new IllegalStateException("Không thể gọi Ollama API: " + ex.getMessage(), ex);
+    }
+  }
+
+  private DocumentContext prepareDocumentContext(String uploadedFileName, DocumentContents document,
+      List<ChapterContent> chapters) throws InterruptedException {
+    EbookMetadata metadata = document.getMetadata();
+    DocumentLanguage language = document.getLanguage();
+    // Tài liệu có cấu trúc nếu có nhiều hơn 1 chương, hoặc có 1 chương nhưng không phải "Toàn bộ sách"
+    boolean isStructured = chapters.size() > 1 || (chapters.size() == 1 && !chapters.get(0).getTitle().equals("Toàn bộ sách"));
+
+    List<ChapterSummary> chapterSummaries = new ArrayList<>();
+    
+    if (!isStructured) {
+      // Nếu không có chương rõ ràng, phân tích nội dung tài liệu
+      ChapterContent fullContent = chapters.get(0);
+      String analysis;
+      try {
+        // Phân tích nội dung tài liệu
+        String prompt = buildDocumentAnalysisPrompt(language, fullContent.getBody());
+        String systemPrompt = language == DocumentLanguage.VIETNAMESE
+            ? "Bạn là chuyên gia phân tích tài liệu. Hãy phân tích và tóm tắt nội dung tài liệu một cách chi tiết."
+            : "You are a document analysis expert. Analyze and summarize the document content in detail.";
+        
+        analysis = callOllamaChat(systemPrompt, prompt, Duration.ofSeconds(90));
+        if (analysis == null || analysis.isBlank()) {
+          // Fallback to Gemini
+          ensureGeminiConfigured();
+          GenerateContentResponse response = getGeminiClient().models.generateContent(
+              geminiModelCandidates(language)[0], prompt, null);
+          analysis = response != null ? response.text() : null;
+          if (analysis == null || analysis.isBlank()) {
+            // Final fallback: use first part of content
+            String body = fullContent.getBody();
+            if (body.length() > 1000) {
+              analysis = body.substring(0, 1000) + "...";
+            } else {
+              analysis = body;
+            }
+          }
+        }
+      } catch (Exception ex) {
+        // Nếu không phân tích được, sử dụng một phần nội dung
+        String body = fullContent.getBody();
+        if (body.length() > 1000) {
+          analysis = body.substring(0, 1000) + "...";
+        } else {
+          analysis = body;
+        }
+      }
+      chapterSummaries.add(new ChapterSummary("Phân tích tài liệu", analysis, fullContent.getBody()));
+    } else {
+      // Có nhiều chương, tóm tắt từng chương
+      for (ChapterContent chapter : chapters) {
+        String summary;
+        try {
+          // Tóm tắt chương
+          summary = summarizeTextWithOllama(chapter.getTitle(), chapter.getBody(), language);
+          if (summary == null || summary.isBlank()) {
+            summary = summarizeTextWithGemini(chapter.getTitle(), chapter.getBody(), language);
+          }
+        } catch (Exception ex) {
+          // Nếu không tóm tắt được, sử dụng một phần nội dung
+          String body = chapter.getBody();
+          if (body.length() > 500) {
+            summary = body.substring(0, 500) + "...";
+          } else {
+            summary = body;
+          }
+        }
+        chapterSummaries.add(new ChapterSummary(chapter.getTitle(), summary, chapter.getBody()));
+      }
     }
 
-    throw new IllegalStateException("Ollama API không trả về phần tóm tắt hợp lệ.");
+    return new DocumentContext(uploadedFileName, metadata, chapterSummaries, language, isStructured);
+  }
+
+  private String buildDocumentAnalysisPrompt(DocumentLanguage language, String documentText) {
+    String trimmedText = documentText.length() > MAX_SUMMARY_SOURCE_CHARACTERS
+        ? documentText.substring(0, MAX_SUMMARY_SOURCE_CHARACTERS)
+        : documentText;
+    
+    if (language == DocumentLanguage.VIETNAMESE) {
+      return String.format(Locale.forLanguageTag("vi"), String.join("%n",
+          "Hãy phân tích và tóm tắt nội dung tài liệu sau đây bằng tiếng Việt:",
+          "- Xác định chủ đề chính và các chủ đề phụ",
+          "- Liệt kê các khái niệm, công thức, hoặc điểm quan trọng",
+          "- Tóm tắt nội dung một cách có cấu trúc và dễ hiểu",
+          "- Nếu có ví dụ hoặc số liệu quan trọng, hãy đề cập đến",
+          "Nội dung tài liệu (đã cắt ngắn nếu quá dài):",
+          "%s"), trimmedText);
+    }
+    
+    return String.format(Locale.ENGLISH, String.join("%n",
+        "Please analyze and summarize the following document content in English:",
+        "- Identify main and sub-topics",
+        "- List key concepts, formulas, or important points",
+        "- Summarize the content in a structured and understandable way",
+        "- Mention any important examples or figures if present",
+        "Document content (truncated if necessary):",
+        "%s"), trimmedText);
+  }
+
+  private void handleGenerateAudioRequest(HttpServletRequest request, HttpServletResponse response)
+      throws ServletException, IOException, InterruptedException {
+    HttpSession session = request.getSession(false);
+    if (session == null) {
+      forwardWithError(request, response, "Phiên làm việc đã hết hạn. Vui lòng tải lên tài liệu lại.");
+      return;
+    }
+
+    DocumentContext context = (DocumentContext) session.getAttribute(SESSION_ATTR_DOCUMENT_CONTEXT);
+    if (context == null) {
+      forwardWithError(request, response, "Không tìm thấy dữ liệu tài liệu. Vui lòng tải lên tài liệu lại.");
+      return;
+    }
+
+    // Lấy chỉ số chương cần tạo audio
+    String chapterIndexStr = request.getParameter("chapterIndex");
+    if (chapterIndexStr == null || chapterIndexStr.isBlank()) {
+      forwardWithError(request, response, "Không tìm thấy thông tin chương cần tạo audio.");
+      return;
+    }
+
+    int chapterIndex;
+    try {
+      chapterIndex = Integer.parseInt(chapterIndexStr);
+    } catch (NumberFormatException ex) {
+      forwardWithError(request, response, "Chỉ số chương không hợp lệ.");
+      return;
+    }
+
+    List<ChapterSummary> chapters = context.getChapters();
+    if (chapterIndex < 0 || chapterIndex >= chapters.size()) {
+      forwardWithError(request, response, "Chỉ số chương không hợp lệ.");
+      return;
+    }
+
+    ChapterSummary chapter = chapters.get(chapterIndex);
+    
+    // Kiểm tra xem đã có audio chưa
+    if (chapter.getAudioFileName() != null && !chapter.getAudioFileName().isEmpty()) {
+      // Đã có audio, quay lại trang danh sách chương
+      request.setAttribute("metadata", context.getMetadata());
+      request.setAttribute("chapters", context.getChapters());
+      request.setAttribute("uploadedFileName", context.getUploadedFileName());
+      request.setAttribute("isStructuredDocument", context.isStructured());
+      request.getRequestDispatcher("/chapters.jsp").forward(request, response);
+      return;
+    }
+
+    Path audioDirectory = resolveAudioOutputDirectory();
+    getServletContext().setAttribute("audioOutputDirectory", audioDirectory);
+
+    // Tạo audio cho chương được chọn
+    try {
+      Path audioFile = generateAudioForChapter(chapter.getTitle(), chapter.getSummary(), audioDirectory,
+          context.getLanguage());
+      String audioFileName = audioFile.getFileName().toString();
+      chapter.setAudioFileName(audioFileName);
+    } catch (Exception ex) {
+      forwardWithError(request, response, "Lỗi khi tạo audio cho chương: " + ex.getMessage());
+      return;
+    }
+
+    // Cập nhật context trong session
+    session.setAttribute(SESSION_ATTR_DOCUMENT_CONTEXT, context);
+    synchronizeAudioDownloadItems(context, session);
+
+    // Quay lại trang danh sách chương để hiển thị audio đã tạo
+    request.setAttribute("metadata", context.getMetadata());
+    request.setAttribute("chapters", context.getChapters());
+    request.setAttribute("uploadedFileName", context.getUploadedFileName());
+    request.setAttribute("isStructuredDocument", context.isStructured());
+
+    request.getRequestDispatcher("/chapters.jsp").forward(request, response);
+  }
+
+  private Path generateAudioForChapter(String chapterTitle, String summaryText, Path audioDirectory,
+      DocumentLanguage language) throws IOException, InterruptedException {
+    return generateAudioWithIflytek(chapterTitle, summaryText, audioDirectory);
+  }
+
+  private void synchronizeAudioDownloadItems(DocumentContext context, HttpSession session) {
+    // Method này có thể được implement sau nếu cần
+    // Hiện tại chỉ để giữ tương thích với code cũ
+  }
+
+  private void handleQuestionBankResponse(HttpServletRequest request, HttpServletResponse response,
+      DocumentContents document, List<ChapterContent> chapters, String uploadedFileName) throws IOException {
+    DocumentLanguage language = document.getLanguage();
+    String systemPrompt = language == DocumentLanguage.VIETNAMESE
+        ? "Bạn là chuyên gia đo lường giáo dục. Hãy sinh ngân hàng câu hỏi trắc nghiệm thích ứng chất lượng cao."
+        : "You are an educational measurement expert who produces high-quality adaptive multiple-choice banks.";
+
+    String userPrompt = buildQuestionBankPrompt(language, document.getMetadata(), chapters);
+    String rawResponse;
+    try {
+      rawResponse = callOllamaChat(systemPrompt, userPrompt, Duration.ofSeconds(180));
+    } catch (OllamaRateLimitException rateLimit) {
+      rawResponse = fallbackQuestionBankWithGemini(language, systemPrompt, userPrompt);
+    }
+    if (rawResponse == null || rawResponse.isBlank()) {
+      throw new IllegalStateException("Hệ thống không trả về nội dung ngân hàng câu hỏi.");
+    }
+
+    List<QuestionBankItem> items = parseQuestionItems(rawResponse, language);
+    if (items.size() < QUESTION_BANK_TARGET_COUNT) {
+      throw new IllegalStateException(String.format(Locale.ROOT,
+          "Mô hình chỉ trả về %d câu hỏi, cần tối thiểu %d câu hỏi.", items.size(), QUESTION_BANK_TARGET_COUNT));
+    }
+    if (items.size() > QUESTION_BANK_TARGET_COUNT) {
+      items = new ArrayList<>(items.subList(0, QUESTION_BANK_TARGET_COUNT));
+    }
+
+    normalizeQuestionBankItems(items);
+    assignIrtParameters(items);
+    validateQuestionBankItems(items);
+
+    JsonArray output = new JsonArray();
+    int sequence = 1;
+    for (QuestionBankItem item : items) {
+      item.id = sequence++;
+      output.add(serializeQuestionBankItem(item));
+    }
+
+    String resolvedTitle = resolveDownloadBookTitle(document.getMetadata(), uploadedFileName);
+    String fileName = buildQuestionBankFilename(resolvedTitle);
+    byte[] payload = GSON.toJson(output).getBytes(StandardCharsets.UTF_8);
+
+    response.setCharacterEncoding(StandardCharsets.UTF_8.name());
+    response.setContentType("application/json; charset=UTF-8");
+    response.setHeader("Content-Disposition", "attachment; filename=\"" + fileName + "\"");
+    response.setContentLength(payload.length);
+    response.getOutputStream().write(payload);
+    response.flushBuffer();
+  }
+
+  private String buildQuestionBankPrompt(DocumentLanguage language, EbookMetadata metadata,
+      List<ChapterContent> chapters) {
+    StringBuilder context = new StringBuilder();
+    if (metadata != null) {
+      context.append(language == DocumentLanguage.VIETNAMESE ? "Tiêu đề: " : "Title: ")
+          .append(metadata.getTitle()).append('\n');
+      context.append(language == DocumentLanguage.VIETNAMESE ? "Tác giả: " : "Author: ")
+          .append(metadata.getAuthor()).append('\n');
+      context.append(language == DocumentLanguage.VIETNAMESE ? "Năm xuất bản: " : "Publication year: ")
+          .append(metadata.getPublicationYear()).append('\n');
+      if (metadata.getSubject() != null && !metadata.getSubject().isBlank()) {
+        context.append(language == DocumentLanguage.VIETNAMESE ? "Chủ đề: " : "Subject: ")
+            .append(metadata.getSubject()).append('\n');
+      }
+      context.append('\n');
+    }
+
+    int remaining = QUESTION_BANK_MAX_CONTEXT_CHARS;
+    for (ChapterContent chapter : chapters) {
+      if (remaining <= 0) {
+        break;
+      }
+      String title = chapter.getTitle() == null ? "Chương" : chapter.getTitle();
+      String body = chapter.getBody() == null ? "" : chapter.getBody().trim();
+      if (body.isEmpty()) {
+        continue;
+      }
+      String truncated = body.length() > remaining ? body.substring(0, remaining) : body;
+      context.append("### ").append(title).append('\n');
+      context.append(truncated).append("\n\n");
+      remaining -= truncated.length();
+    }
+
+    String instructions;
+    if (language == DocumentLanguage.VIETNAMESE) {
+      instructions = String.join("\n",
+          "Hãy tạo ra CHÍNH XÁC 150 câu hỏi trắc nghiệm bốn lựa chọn dựa trên nội dung giáo trình bên dưới.",
+          "Yêu cầu bắt buộc:",
+          "1. Mỗi câu hỏi tập trung vào một khái niệm/h kỹ-năng quan trọng, không hỏi chung chung.",
+          "2. Trả về DUY NHẤT một mảng JSON, không kèm giải thích hay văn bản khác.",
+          "3. Mỗi phần tử phải có cấu trúc: {\"question\", \"options\", \"answer\", \"difficulty\"}.",
+          "   - \"options\" là mảng 4 lựa chọn rõ ràng, không trùng nhau.",
+          "   - \"answer\" khớp chính xác với một lựa chọn trong \"options\" (không chỉ dùng chữ cái).",
+          "   - \"difficulty\" chỉ nhận một trong ba giá trị: Easy, Medium, Hard.",
+          "4. Phân bố độ khó cân bằng (xấp xỉ 1/3 mỗi mức) và hỗ trợ kiểm tra thích ứng (IRT 3 tham số).",
+          "5. Chỉ sử dụng thông tin tồn tại trong giáo trình. Không tự bịa dữ liệu.",
+          "6. Không nhúng JSON trong mã Markdown. Không dùng chú thích thêm.",
+          "Nội dung giáo trình:\n" + context.toString());
+    } else {
+      instructions = String.join("\n",
+          "Generate EXACTLY 150 four-option multiple-choice questions from the course content below.",
+          "Constraints:",
+          "1. Focus each question on a precise concept or skill from the material.",
+          "2. Return a single JSON array only, no additional commentary.",
+          "3. Each item must include keys: {\"question\", \"options\", \"answer\", \"difficulty\"}.",
+          "   - \"options\": array of four distinct, fully written choices.",
+          "   - \"answer\": match exactly one option string (not just a letter).",
+          "   - \"difficulty\": one of Easy, Medium, Hard.",
+          "4. Keep difficulty roughly balanced (≈1/3 each) to support adaptive testing.",
+          "5. Use only facts stated in the source material. No fabricated details.",
+          "6. Do NOT wrap the JSON in Markdown code fences.",
+          "Course corpus:\n" + context.toString());
+    }
+    return instructions;
+  }
+
+  private String fallbackQuestionBankWithGemini(DocumentLanguage language, String systemPrompt, String userPrompt) {
+    String combinedPrompt = systemPrompt + System.lineSeparator() + System.lineSeparator() + userPrompt;
+    try {
+      return callGeminiForJson(combinedPrompt, language);
+    } catch (IllegalStateException ex) {
+      throw new IllegalStateException(
+          "Ollama bị giới hạn và fallback Gemini thất bại: " + ex.getMessage(), ex);
+    }
+  }
+
+  private String callGeminiForJson(String prompt, DocumentLanguage language) {
+    ensureGeminiConfigured();
+
+    GenerateContentResponse response = null;
+    RuntimeException lastModelException = null;
+    String[] candidates = geminiModelCandidates(language);
+    if (candidates.length == 0) {
+      throw new IllegalStateException("Không tìm thấy cấu hình model Gemini phù hợp cho ngôn ngữ.");
+    }
+    for (String modelName : candidates) {
+      try {
+        response = getGeminiClient().models.generateContent(modelName, prompt, null);
+        lastModelException = null;
+        break;
+      } catch (RuntimeException ex) {
+        if (isModelNotFound(ex)) {
+          lastModelException = ex;
+          continue;
+        }
+        throw new IllegalStateException("Không thể gọi Gemini API: " + ex.getMessage(), ex);
+      }
+    }
+
+    if (response == null) {
+      if (lastModelException != null) {
+        throw new IllegalStateException(
+            "Không thể gọi Gemini API với các model khả dụng. Hãy cập nhật tên model trong cấu hình.",
+            lastModelException);
+      }
+      throw new IllegalStateException("Gemini API không trả về nội dung văn bản.");
+    }
+
+    String text = response.text();
+    if (text == null || text.isBlank()) {
+      throw new IllegalStateException("Gemini API không trả về nội dung văn bản.");
+    }
+    return text.trim();
+  }
+
+  private List<QuestionBankItem> parseQuestionItems(String rawResponse, DocumentLanguage language) {
+    String payload = extractJsonPayload(rawResponse);
+    if (payload == null || payload.isBlank()) {
+      throw new IllegalStateException("Không thể tách JSON từ phản hồi của mô hình.");
+    }
+
+    JsonElement root;
+    try {
+      root = JsonParser.parseString(payload);
+    } catch (RuntimeException ex) {
+      throw new IllegalStateException("JSON ngân hàng câu hỏi không hợp lệ: " + ex.getMessage(), ex);
+    }
+
+    JsonArray itemsArray = resolveQuestionArray(root);
+    if (itemsArray == null || itemsArray.isEmpty()) {
+      throw new IllegalStateException("Không tìm thấy mảng câu hỏi trong phản hồi.");
+    }
+
+    List<QuestionBankItem> items = new ArrayList<>(itemsArray.size());
+    for (JsonElement element : itemsArray) {
+      if (element == null || element.isJsonNull() || !element.isJsonObject()) {
+        continue;
+      }
+      JsonObject obj = element.getAsJsonObject();
+      QuestionBankItem item = new QuestionBankItem();
+      item.id = items.size() + 1;
+      item.question = safeTrim(firstNonNull(
+          getString(obj, "question"),
+          getString(obj, "prompt"),
+          getString(obj, "stem")));
+      item.options = extractOptions(obj);
+      item.answer = resolveAnswer(obj, item.options);
+      item.difficulty = formatDifficultyLabel(firstNonNull(
+          getString(obj, "difficulty"),
+          getString(obj, "level"),
+          getString(obj, "difficulty_level")));
+      items.add(item);
+    }
+    return items;
+  }
+
+  private JsonArray resolveQuestionArray(JsonElement root) {
+    if (root == null || root.isJsonNull()) {
+      return null;
+    }
+    if (root.isJsonArray()) {
+      return root.getAsJsonArray();
+    }
+    if (root.isJsonObject()) {
+      JsonObject obj = root.getAsJsonObject();
+      if (obj.has("questions") && obj.get("questions").isJsonArray()) {
+        return obj.getAsJsonArray("questions");
+      }
+      if (obj.has("items") && obj.get("items").isJsonArray()) {
+        return obj.getAsJsonArray("items");
+      }
+      for (Map.Entry<String, JsonElement> entry : obj.entrySet()) {
+        if (entry.getValue() != null && entry.getValue().isJsonArray()) {
+          return entry.getValue().getAsJsonArray();
+        }
+      }
+    }
+    return null;
+  }
+
+  private List<String> extractOptions(JsonObject obj) {
+    List<String> options = new ArrayList<>();
+    if (obj == null) {
+      return options;
+    }
+    if (obj.has("options")) {
+      JsonElement element = obj.get("options");
+      if (element.isJsonArray()) {
+        collectOptionsFromArray(element.getAsJsonArray(), options);
+      } else if (element.isJsonObject()) {
+        collectOptionsFromObject(element.getAsJsonObject(), options);
+      }
+    }
+    if (options.size() < QUESTION_BANK_MIN_OPTIONS && obj.has("choices")) {
+      JsonElement element = obj.get("choices");
+      if (element.isJsonArray()) {
+        collectOptionsFromArray(element.getAsJsonArray(), options);
+      } else if (element.isJsonObject()) {
+        collectOptionsFromObject(element.getAsJsonObject(), options);
+      }
+    }
+    if (options.size() < QUESTION_BANK_MIN_OPTIONS && obj.has("answers") && obj.get("answers").isJsonArray()) {
+      collectOptionsFromArray(obj.getAsJsonArray("answers"), options);
+    }
+    return options;
+  }
+
+  private void collectOptionsFromArray(JsonArray array, List<String> options) {
+    for (JsonElement elem : array) {
+      if (elem == null || elem.isJsonNull()) {
+        continue;
+      }
+      if (elem.isJsonPrimitive()) {
+        addOptionIfValid(options, elem.getAsString());
+      } else if (elem.isJsonObject()) {
+        JsonObject obj = elem.getAsJsonObject();
+        if (obj.has("text")) {
+          addOptionIfValid(options, obj.get("text").getAsString());
+        } else if (obj.has("value")) {
+          addOptionIfValid(options, obj.get("value").getAsString());
+        }
+      }
+    }
+  }
+
+  private void collectOptionsFromObject(JsonObject object, List<String> options) {
+    char[] labels = { 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H' };
+    for (char label : labels) {
+      String key = String.valueOf(label);
+      if (object.has(key) && object.get(key).isJsonPrimitive()) {
+        addOptionIfValid(options, object.get(key).getAsString());
+      }
+    }
+    for (Map.Entry<String, JsonElement> entry : object.entrySet()) {
+      if (options.size() >= QUESTION_BANK_MIN_OPTIONS) {
+        break;
+      }
+      JsonElement value = entry.getValue();
+      if (value != null && value.isJsonPrimitive()) {
+        addOptionIfValid(options, value.getAsString());
+      }
+    }
+  }
+
+  private void addOptionIfValid(List<String> options, String candidate) {
+    String normalized = normalizeOptionText(candidate);
+    if (normalized == null) {
+      return;
+    }
+    if (!options.contains(normalized)) {
+      options.add(normalized);
+    }
+  }
+
+  private String resolveAnswer(JsonObject obj, List<String> options) {
+    String answer = firstNonNull(
+        getString(obj, "answer"),
+        getString(obj, "correct_answer"),
+        getString(obj, "correctOption"),
+        getString(obj, "correct_option"),
+        getString(obj, "solution"),
+        getString(obj, "key"));
+
+    if ((answer == null || answer.isBlank()) && obj.has("correct_option_index")
+        && obj.get("correct_option_index").isJsonPrimitive()) {
+      int idx = obj.get("correct_option_index").getAsInt();
+      if (idx >= 0 && options != null && idx < options.size()) {
+        answer = options.get(idx);
+      }
+    }
+
+    if ((answer == null || answer.isBlank()) && obj.has("correct_index")
+        && obj.get("correct_index").isJsonPrimitive()) {
+      int idx = obj.get("correct_index").getAsInt();
+      if (idx >= 0 && options != null && idx < options.size()) {
+        answer = options.get(idx);
+      }
+    }
+
+    if ((answer == null || answer.isBlank()) && obj.has("correct_letter")
+        && obj.get("correct_letter").isJsonPrimitive()) {
+      answer = obj.get("correct_letter").getAsString();
+    }
+
+    if ((answer == null || answer.isBlank()) && obj.has("correct_option_letter")
+        && obj.get("correct_option_letter").isJsonPrimitive()) {
+      answer = obj.get("correct_option_letter").getAsString();
+    }
+
+    return normalizeAnswer(answer, options);
+  }
+
+  private void normalizeQuestionBankItems(List<QuestionBankItem> items) {
+    for (QuestionBankItem item : items) {
+      if (item.question != null) {
+        item.question = item.question.trim();
+      }
+      if (item.options == null) {
+        item.options = new ArrayList<>();
+      } else {
+        List<String> normalized = new ArrayList<>(item.options.size());
+        for (String option : item.options) {
+          addOptionIfValid(normalized, option);
+        }
+        item.options = normalized;
+      }
+      item.answer = normalizeAnswer(item.answer, item.options);
+      item.difficulty = formatDifficultyLabel(item.difficulty);
+    }
+  }
+
+  private void validateQuestionBankItems(List<QuestionBankItem> items) {
+    for (int i = 0; i < items.size(); i++) {
+      QuestionBankItem item = items.get(i);
+      if (item.question == null || item.question.isBlank()) {
+        throw new IllegalStateException("Câu hỏi thứ " + (i + 1) + " thiếu nội dung.");
+      }
+      if (item.options == null || item.options.size() < QUESTION_BANK_MIN_OPTIONS) {
+        throw new IllegalStateException(
+            "Câu hỏi thứ " + (i + 1) + " không có đủ lựa chọn (cần tối thiểu " + QUESTION_BANK_MIN_OPTIONS + ").");
+      }
+      if (item.answer == null || item.answer.isBlank()) {
+        throw new IllegalStateException("Câu hỏi thứ " + (i + 1) + " thiếu đáp án khớp lựa chọn.");
+      }
+      if (!item.options.contains(item.answer)) {
+        throw new IllegalStateException(
+            "Đáp án của câu hỏi thứ " + (i + 1) + " không khớp bất kỳ lựa chọn nào.");
+      }
+    }
+  }
+
+  private JsonObject serializeQuestionBankItem(QuestionBankItem item) {
+    JsonObject obj = new JsonObject();
+    obj.addProperty("id", item.id);
+    obj.addProperty("question", item.question);
+    JsonArray optionsArray = new JsonArray();
+    for (String option : item.options) {
+      optionsArray.add(option);
+    }
+    obj.add("options", optionsArray);
+    obj.addProperty("answer", item.answer);
+    obj.addProperty("difficulty", item.difficulty);
+    obj.addProperty("param_a", roundToThreeDecimals(item.param_a));
+    obj.addProperty("param_b", roundToThreeDecimals(item.param_b));
+    obj.addProperty("param_c", roundToThreeDecimals(item.param_c));
+    return obj;
+  }
+
+  private void assignIrtParameters(List<QuestionBankItem> items) {
+    if (items.isEmpty()) {
+      return;
+    }
+    int total = items.size();
+    int easyTarget = Math.max(0, Math.min(total, (int) Math.round(total * QUESTION_BANK_EASY_RATIO)));
+    int hardTarget = Math.max(0, Math.min(total, (int) Math.round(total * QUESTION_BANK_HARD_RATIO)));
+    int mediumTarget = Math.max(0, total - easyTarget - hardTarget);
+
+    int easyCount = 0;
+    int mediumCount = 0;
+    int hardCount = 0;
+
+    for (QuestionBankItem item : items) {
+      String difficultyLabel = formatDifficultyLabel(item.difficulty);
+      DifficultyRange preferred = DifficultyRange.forDifficulty(difficultyLabel);
+      DifficultyRange assigned = rebalanceRange(preferred, easyCount, easyTarget, mediumCount, mediumTarget, hardCount,
+          hardTarget);
+      switch (assigned) {
+        case EASY:
+          easyCount++;
+          item.difficulty = "Easy";
+          break;
+        case HARD:
+          hardCount++;
+          item.difficulty = "Hard";
+          break;
+        case MEDIUM:
+        default:
+          mediumCount++;
+          item.difficulty = "Medium";
+          break;
+      }
+
+      ThreadLocalRandom rng = ThreadLocalRandom.current();
+      item.param_a = rng.nextDouble(assigned.aMin, assigned.aMax);
+      item.param_b = rng.nextDouble(assigned.bMin, assigned.bMax);
+      item.param_c = rng.nextDouble(assigned.cMin, assigned.cMax);
+    }
+  }
+
+  private DifficultyRange rebalanceRange(DifficultyRange preferred, int easyCount, int easyTarget, int mediumCount,
+      int mediumTarget, int hardCount, int hardTarget) {
+    if (preferred == DifficultyRange.EASY && easyCount < easyTarget) {
+      return preferred;
+    }
+    if (preferred == DifficultyRange.MEDIUM && mediumCount < mediumTarget) {
+      return preferred;
+    }
+    if (preferred == DifficultyRange.HARD && hardCount < hardTarget) {
+      return preferred;
+    }
+
+    if (mediumCount < mediumTarget) {
+      return DifficultyRange.MEDIUM;
+    }
+    if (easyCount < easyTarget) {
+      return DifficultyRange.EASY;
+    }
+    if (hardCount < hardTarget) {
+      return DifficultyRange.HARD;
+    }
+    return preferred;
+  }
+
+  private double roundToThreeDecimals(double value) {
+    return Math.round(value * 1000d) / 1000d;
+  }
+
+  private String buildQuestionBankFilename(String baseTitle) {
+    String sanitized = sanitizeForFilename(baseTitle == null ? "question-bank" : baseTitle);
+    if (sanitized.isBlank()) {
+      sanitized = "question-bank";
+    }
+    String timestamp = ZonedDateTime.now(ZoneOffset.UTC).format(QUESTION_BANK_FILENAME_FORMATTER);
+    return sanitized + "-question-bank-" + timestamp + ".json";
+  }
+
+  private String extractJsonPayload(String raw) {
+    if (raw == null) {
+      return null;
+    }
+    String trimmed = raw.trim();
+    if (trimmed.startsWith("```")) {
+      int firstBreak = trimmed.indexOf('\n');
+      if (firstBreak >= 0) {
+        trimmed = trimmed.substring(firstBreak + 1);
+      }
+      int fence = trimmed.lastIndexOf("```");
+      if (fence >= 0) {
+        trimmed = trimmed.substring(0, fence);
+      }
+      trimmed = trimmed.trim();
+    }
+    try {
+      JsonElement element = JsonParser.parseString(trimmed);
+      if (element.isJsonArray() || element.isJsonObject()) {
+        return trimmed;
+      }
+    } catch (RuntimeException ignore) {
+      // Fall back to substring detection below.
+    }
+    int arrayStart = trimmed.indexOf('[');
+    int arrayEnd = trimmed.lastIndexOf(']');
+    if (arrayStart >= 0 && arrayEnd > arrayStart) {
+      return trimmed.substring(arrayStart, arrayEnd + 1);
+    }
+    int objectStart = trimmed.indexOf('{');
+    int objectEnd = trimmed.lastIndexOf('}');
+    if (objectStart >= 0 && objectEnd > objectStart) {
+      return trimmed.substring(objectStart, objectEnd + 1);
+    }
+    return null;
+  }
+
+  private String normalizeOptionText(String value) {
+    if (value == null) {
+      return null;
+    }
+    String stripped = value.trim();
+    stripped = stripped.replaceFirst("^(?i)[A-H]\\s*[:\\).\\-]+\\s*", "");
+    stripped = stripped.replaceFirst("^\\u2022\\s*", "");
+    stripped = stripped.replaceFirst("^[-\\u2022]\\s*", "");
+    stripped = stripped.replaceFirst("^\\d+\\s*[\\).\\-]+\\s*", "");
+    stripped = stripped.trim();
+    return stripped.isEmpty() ? null : stripped;
+  }
+
+  private String normalizeAnswer(String rawAnswer, List<String> options) {
+    if (rawAnswer == null) {
+      return null;
+    }
+    String trimmed = rawAnswer.trim();
+    if (trimmed.isEmpty()) {
+      return null;
+    }
+    if (options != null && !options.isEmpty()) {
+      char first = Character.toUpperCase(trimmed.charAt(0));
+      if (first >= 'A' && first <= 'H') {
+        int idx = first - 'A';
+        if (idx < options.size()) {
+          return options.get(idx);
+        }
+      }
+      for (String option : options) {
+        if (trimmed.equalsIgnoreCase(option)) {
+          return option;
+        }
+      }
+    }
+    return trimmed;
+  }
+
+  private String formatDifficultyLabel(String source) {
+    if (source == null || source.isBlank()) {
+      return "Medium";
+    }
+    String normalized = source.trim().toLowerCase(Locale.ROOT);
+    switch (normalized) {
+      case "easy":
+      case "dễ":
+      case "de":
+      case "beginner":
+        return "Easy";
+      case "hard":
+      case "khó":
+      case "kho":
+      case "advanced":
+      case "difficult":
+        return "Hard";
+      default:
+        return "Medium";
+    }
+  }
+
+  private String firstNonNull(String... candidates) {
+    if (candidates == null) {
+      return null;
+    }
+    for (String candidate : candidates) {
+      if (candidate != null && !candidate.isBlank()) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  private String getString(JsonObject obj, String property) {
+    if (obj == null || property == null || !obj.has(property)) {
+      return null;
+    }
+    JsonElement element = obj.get(property);
+    if (element == null || element.isJsonNull() || !element.isJsonPrimitive()) {
+      return null;
+    }
+    return element.getAsString();
   }
 
   private String extractOllamaResponse(JsonObject root) {
@@ -764,6 +1747,71 @@ public class EbookProcessorServlet extends HttpServlet {
       return (apiKey != null && !apiKey.isBlank()) ? OLLAMA_DEFAULT_CLOUD_MODEL : OLLAMA_DEFAULT_LOCAL_MODEL;
     }
     return v.trim();
+  }
+
+  private String resolveOllamaLocalHost() {
+    String v = System.getenv("OLLAMA_LOCAL_HOST");
+    if (v == null || v.isBlank()) {
+      v = System.getProperty("ollama.local.host");
+    }
+    if (v == null || v.isBlank()) {
+      return OLLAMA_DEFAULT_LOCAL_HOST;
+    }
+    return v.trim();
+  }
+
+  private String resolveOllamaLocalModel(String primaryModel) {
+    String v = System.getenv("OLLAMA_LOCAL_MODEL");
+    if (v == null || v.isBlank()) {
+      v = System.getProperty("ollama.local.model");
+    }
+    if (v == null || v.isBlank()) {
+      if (primaryModel != null && !primaryModel.isBlank()) {
+        return primaryModel.trim();
+      }
+      return OLLAMA_DEFAULT_LOCAL_MODEL;
+    }
+    return v.trim();
+  }
+
+  private boolean isLikelyCloudHost(String host, String apiKey) {
+    if (apiKey != null && !apiKey.isBlank()) {
+      return true;
+    }
+    if (host == null || host.isBlank()) {
+      return false;
+    }
+    String normalized = host.trim().toLowerCase(Locale.ROOT);
+    return normalized.contains("ollama.com") || normalized.contains("cloud");
+  }
+
+  private String normalizeOllamaEndpoint(String host) {
+    String base = normalizeHostBase(host);
+    if (base.endsWith("/api/chat")) {
+      return base;
+    }
+    if (base.endsWith("/api/chat/")) {
+      return base.substring(0, base.length() - 1);
+    }
+    if (base.endsWith("/")) {
+      return base + "api/chat";
+    }
+    return base + "/api/chat";
+  }
+
+  private boolean hostsEqual(String a, String b) {
+    return normalizeHostBase(a).equals(normalizeHostBase(b));
+  }
+
+  private String normalizeHostBase(String host) {
+    if (host == null) {
+      return "";
+    }
+    String trimmed = host.trim();
+    if (trimmed.endsWith("/")) {
+      return trimmed.substring(0, trimmed.length() - 1);
+    }
+    return trimmed;
   }
 
   private String resolveDownloadBookTitle(EbookMetadata metadata, String uploadedFileName) {
@@ -1736,6 +2784,74 @@ public class EbookProcessorServlet extends HttpServlet {
         || normalized.contains("unsupported") || normalized.contains("does not exist");
   }
 
+  private static final class OllamaRateLimitException extends IllegalStateException {
+    private static final long serialVersionUID = 1L;
+
+    private OllamaRateLimitException(String endpoint, String responseBody) {
+      super(buildMessage(endpoint, responseBody));
+    }
+
+    private static String buildMessage(String endpoint, String responseBody) {
+      String trimmedBody = responseBody == null ? "" : responseBody.trim();
+      if (trimmedBody.length() > 240) {
+        trimmedBody = trimmedBody.substring(0, 240) + "...";
+      }
+      String location = endpoint == null ? "Ollama" : endpoint;
+      if (trimmedBody.isEmpty()) {
+        return "Ollama API trả về HTTP 429 từ " + location;
+      }
+      return "Ollama API trả về HTTP 429 từ " + location + ": " + trimmedBody;
+    }
+  }
+
+  private static final class QuestionBankItem {
+    private int id;
+    private String question;
+    private List<String> options;
+    private String answer;
+    private String difficulty;
+    private double param_a;
+    private double param_b;
+    private double param_c;
+  }
+
+  private enum DifficultyRange {
+    EASY(0.6d, 1.0d, -2.0d, -0.5d, 0.22d, 0.30d),
+    MEDIUM(1.0d, 1.5d, -0.5d, 0.8d, 0.10d, 0.18d),
+    HARD(1.5d, 2.5d, 0.8d, 2.5d, 0.05d, 0.12d);
+
+    private final double aMin;
+    private final double aMax;
+    private final double bMin;
+    private final double bMax;
+    private final double cMin;
+    private final double cMax;
+
+    DifficultyRange(double aMin, double aMax, double bMin, double bMax, double cMin, double cMax) {
+      this.aMin = aMin;
+      this.aMax = aMax;
+      this.bMin = bMin;
+      this.bMax = bMax;
+      this.cMin = cMin;
+      this.cMax = cMax;
+    }
+
+    private static DifficultyRange forDifficulty(String difficulty) {
+      if (difficulty == null) {
+        return EASY;
+      }
+      switch (difficulty.toLowerCase(Locale.ROOT)) {
+        case "easy":
+          return EASY;
+        case "hard":
+          return HARD;
+        case "medium":
+        default:
+          return MEDIUM;
+      }
+    }
+  }
+
   private static final class DocumentContents {
     private final String fullText;
     private final EbookMetadata metadata;
@@ -1812,10 +2928,14 @@ public class EbookProcessorServlet extends HttpServlet {
   private static final class ChapterContent {
     private final String title;
     private final String body;
+    private final int startOffset;
+    private final Integer sequence;
 
-    private ChapterContent(String title, String body) {
+    private ChapterContent(String title, String body, int startOffset, Integer sequence) {
       this.title = title;
       this.body = body;
+      this.startOffset = startOffset;
+      this.sequence = sequence;
     }
 
     public String getTitle() {
@@ -1824,6 +2944,14 @@ public class EbookProcessorServlet extends HttpServlet {
 
     public String getBody() {
       return body;
+    }
+
+    public int getStartOffset() {
+      return startOffset;
+    }
+
+    public Integer getSequence() {
+      return sequence;
     }
   }
 
@@ -1848,6 +2976,89 @@ public class EbookProcessorServlet extends HttpServlet {
 
     public String getAudioFileName() {
       return audioFileName;
+    }
+  }
+
+  private static final class DocumentContext {
+    private final String uploadedFileName;
+    private final EbookMetadata metadata;
+    private final List<ChapterSummary> chapters;
+    private final DocumentLanguage language;
+    private final boolean isStructured;
+
+    private DocumentContext(String uploadedFileName, EbookMetadata metadata, List<ChapterSummary> chapters,
+        DocumentLanguage language, boolean isStructured) {
+      this.uploadedFileName = uploadedFileName;
+      this.metadata = metadata;
+      this.chapters = chapters;
+      this.language = language;
+      this.isStructured = isStructured;
+    }
+
+    public String getUploadedFileName() {
+      return uploadedFileName;
+    }
+
+    public EbookMetadata getMetadata() {
+      return metadata;
+    }
+
+    public List<ChapterSummary> getChapters() {
+      return chapters;
+    }
+
+    public DocumentLanguage getLanguage() {
+      return language;
+    }
+
+    public boolean isStructured() {
+      return isStructured;
+    }
+
+    public boolean hasAnyAudio() {
+      return chapters.stream().anyMatch(ch -> ch.getAudioFileName() != null);
+    }
+
+    public List<ChapterResult> toChapterResults() {
+      List<ChapterResult> results = new ArrayList<>();
+      for (ChapterSummary chapter : chapters) {
+        results.add(new ChapterResult(chapter.getTitle(), chapter.getSummary(), chapter.getAudioFileName()));
+      }
+      return results;
+    }
+  }
+
+  public static final class ChapterSummary {
+    private final String title;
+    private final String summary;
+    private final String body;
+    private String audioFileName;
+
+    public ChapterSummary(String title, String summary, String body) {
+      this.title = title;
+      this.summary = summary;
+      this.body = body;
+      this.audioFileName = null;
+    }
+
+    public String getTitle() {
+      return title;
+    }
+
+    public String getSummary() {
+      return summary;
+    }
+
+    public String getBody() {
+      return body;
+    }
+
+    public String getAudioFileName() {
+      return audioFileName;
+    }
+
+    public void setAudioFileName(String audioFileName) {
+      this.audioFileName = audioFileName;
     }
   }
 }

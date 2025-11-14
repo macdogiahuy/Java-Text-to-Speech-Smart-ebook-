@@ -53,7 +53,10 @@ language="java" %>
         cursor: pointer;
       }
       .actions {
-        text-align: center;
+        display: flex;
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 16px;
       }
       .actions button {
         background-color: #457b9d;
@@ -64,9 +67,16 @@ language="java" %>
         font-size: 16px;
         cursor: pointer;
         transition: background-color 0.2s ease-in-out;
+        min-width: 220px;
+      }
+      .actions button.secondary {
+        background-color: #2d6a4f;
       }
       .actions button:hover {
         background-color: #1d3557;
+      }
+      .actions button.secondary:hover {
+        background-color: #1b4332;
       }
       .note {
         font-size: 14px;
@@ -79,8 +89,7 @@ language="java" %>
     <div class="container">
       <h1>Ebook to Audiobook Converter</h1>
       <p class="subtitle">
-        Tải lên ebook PDF hoặc DOCX của bạn để chuyển thành các bản tóm tắt âm
-        thanh cho từng chương.
+        Tải lên ebook PDF hoặc DOCX của bạn để phân tích và tạo audio cho các chương.
       </p>
 
       <form
@@ -99,11 +108,20 @@ language="java" %>
           />
         </div>
         <div class="actions">
-          <button type="submit">Bắt đầu xử lý</button>
+          <button type="submit" name="action" value="process-audio">
+            Tải lên và phân tích tài liệu
+          </button>
+          <button
+            type="submit"
+            class="secondary"
+            name="action"
+            value="generate-question-bank"
+          >
+            Tạo ngân hàng câu hỏi (150 câu)
+          </button>
         </div>
         <p class="note">
-          Dung lượng tối đa: 100MB. Vui lòng đảm bảo ebook có cấu trúc rõ ràng
-          theo chương.
+          Dung lượng tối đa: 100MB. Hệ thống sẽ tự động phân tích tài liệu và tóm tắt các chương.
         </p>
       </form>
     </div>
