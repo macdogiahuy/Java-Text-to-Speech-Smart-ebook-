@@ -830,11 +830,13 @@ public class EbookProcessorServlet extends HttpServlet {
       List<ChapterContent> chapters) throws InterruptedException {
     EbookMetadata metadata = document.getMetadata();
     DocumentLanguage language = document.getLanguage();
-    // Tài liệu có cấu trúc nếu có nhiều hơn 1 chương, hoặc có 1 chương nhưng không phải "Toàn bộ sách"
-    boolean isStructured = chapters.size() > 1 || (chapters.size() == 1 && !chapters.get(0).getTitle().equals("Toàn bộ sách"));
+    // Tài liệu có cấu trúc nếu có nhiều hơn 1 chương, hoặc có 1 chương nhưng không
+    // phải "Toàn bộ sách"
+    boolean isStructured = chapters.size() > 1
+        || (chapters.size() == 1 && !chapters.get(0).getTitle().equals("Toàn bộ sách"));
 
     List<ChapterSummary> chapterSummaries = new ArrayList<>();
-    
+
     if (!isStructured) {
       // Nếu không có chương rõ ràng, phân tích nội dung tài liệu
       ChapterContent fullContent = chapters.get(0);
@@ -845,7 +847,7 @@ public class EbookProcessorServlet extends HttpServlet {
         String systemPrompt = language == DocumentLanguage.VIETNAMESE
             ? "Bạn là chuyên gia phân tích tài liệu. Hãy phân tích và tóm tắt nội dung tài liệu một cách chi tiết."
             : "You are a document analysis expert. Analyze and summarize the document content in detail.";
-        
+
         analysis = callOllamaChat(systemPrompt, prompt, Duration.ofSeconds(90));
         if (analysis == null || analysis.isBlank()) {
           // Fallback to Gemini
@@ -903,7 +905,7 @@ public class EbookProcessorServlet extends HttpServlet {
     String trimmedText = documentText.length() > MAX_SUMMARY_SOURCE_CHARACTERS
         ? documentText.substring(0, MAX_SUMMARY_SOURCE_CHARACTERS)
         : documentText;
-    
+
     if (language == DocumentLanguage.VIETNAMESE) {
       return String.format(Locale.forLanguageTag("vi"), String.join("%n",
           "Hãy phân tích và tóm tắt nội dung tài liệu sau đây bằng tiếng Việt:",
@@ -914,7 +916,7 @@ public class EbookProcessorServlet extends HttpServlet {
           "Nội dung tài liệu (đã cắt ngắn nếu quá dài):",
           "%s"), trimmedText);
     }
-    
+
     return String.format(Locale.ENGLISH, String.join("%n",
         "Please analyze and summarize the following document content in English:",
         "- Identify main and sub-topics",
@@ -961,7 +963,7 @@ public class EbookProcessorServlet extends HttpServlet {
     }
 
     ChapterSummary chapter = chapters.get(chapterIndex);
-    
+
     // Kiểm tra xem đã có audio chưa
     if (chapter.getAudioFileName() != null && !chapter.getAudioFileName().isEmpty()) {
       // Đã có audio, quay lại trang danh sách chương

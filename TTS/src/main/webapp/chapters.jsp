@@ -134,6 +134,32 @@
             <div class="chapter-summary">
                 <%= escapeHtml(summary.getSummary()).replace("\n", "<br/>") %>
             </div>
+            <div class="chapter-actions">
+                <%
+                    boolean hasAudio = summary.getAudioFileName() != null && !summary.getAudioFileName().isEmpty();
+                    if (hasAudio) {
+                        String audioUrl = response.encodeURL(request.getContextPath() + "/audio?file=" +
+                            java.net.URLEncoder.encode(summary.getAudioFileName(), java.nio.charset.StandardCharsets.UTF_8));
+                        String contentType = summary.getAudioFileName().toLowerCase(java.util.Locale.ROOT).endsWith(".wav") ? "audio/wav" : "audio/mpeg";
+                %>
+                <div class="audio-player">
+                    <audio controls preload="none" style="width: 100%;">
+                        <source src="<%= audioUrl %>" type="<%= contentType %>">
+                        Trình duyệt của bạn không hỗ trợ phát âm thanh.
+                    </audio>
+                </div>
+                <%
+                    } else {
+                %>
+                <form method="post" action="${pageContext.request.contextPath}/process-ebook" style="display: inline;">
+                    <input type="hidden" name="action" value="generate-audio">
+                    <input type="hidden" name="chapterIndex" value="0">
+                    <button type="submit" class="generate-audio-btn">Tạo audio cho bản tóm tắt</button>
+                </form>
+                <%
+                    }
+                %>
+            </div>
         </div>
     </div>
     <%
