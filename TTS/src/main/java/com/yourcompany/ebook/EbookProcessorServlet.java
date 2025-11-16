@@ -113,12 +113,6 @@ public class EbookProcessorServlet extends HttpServlet {
   private static final double MAX_POI_MIN_INFLATE_RATIO = 0.01d;
   private static volatile boolean docxZipSecureConfigured;
 
-  // Ollama configuration defaults
-  private static final String OLLAMA_DEFAULT_LOCAL_HOST = "http://localhost:11434";
-  private static final String OLLAMA_DEFAULT_CLOUD_HOST = "https://ollama.com";
-  private static final String OLLAMA_DEFAULT_LOCAL_MODEL = "gemma3:1b";
-  private static final String OLLAMA_DEFAULT_CLOUD_MODEL = "gpt-oss:120b-cloud";
-
   private static final Pattern CHAPTER_HEADING_PATTERN = Pattern.compile(
       "(?im)^(chapter\\s+(\\d+|[ivxlcdm]+)\\b.*|chương\\s+\\d+\\b.*|chapitre\\s+\\d+\\b.*|ch\\.?\\s*\\d+\\b.*|\\d+\\.\\s+chapter\\b.*)$");
   private static final Pattern[] AUTHOR_HINT_PATTERNS = {
@@ -651,15 +645,17 @@ public class EbookProcessorServlet extends HttpServlet {
     return DocumentLanguage.ENGLISH;
   }
 
-  @SuppressWarnings("unused")
   private String summarizeTextWithGemini(String chapterTitle, String chapterText, DocumentLanguage language) {
-    ensureGeminiConfigured();
-
     String trimmedText = chapterText.length() > MAX_SUMMARY_SOURCE_CHARACTERS
         ? chapterText.substring(0, MAX_SUMMARY_SOURCE_CHARACTERS)
         : chapterText;
 
     String prompt = buildGeminiPrompt(language, chapterTitle, trimmedText);
+    return callGemini(prompt, language);
+  }
+
+  private String callGemini(String prompt, DocumentLanguage language) {
+    ensureGeminiConfigured();
 
     GenerateContentResponse response = null;
     RuntimeException lastModelException = null;
@@ -687,143 +683,14 @@ public class EbookProcessorServlet extends HttpServlet {
             "Không thể gọi Gemini API với các model khả dụng. Hãy cập nhật tên model trong cấu hình.",
             lastModelException);
       }
-      throw new IllegalStateException("Gemini API không trả về nội dung tóm tắt.");
+      throw new IllegalStateException("Gemini API không trả về nội dung văn bản.");
     }
 
-    String summary = response == null ? null : response.text();
-    if (summary == null || summary.isBlank()) {
-      throw new IllegalStateException("Gemini API không trả về nội dung tóm tắt.");
+    String text = response.text();
+    if (text == null || text.isBlank()) {
+      throw new IllegalStateException("Gemini API không trả về nội dung văn bản.");
     }
-    return summary.trim();
-  }
-
-  private String summarizeTextWithOllama(String chapterTitle, String chapterText, DocumentLanguage language) {
-    // Build a prompt similar to the Gemini prompt but tailored for Ollama-powered
-    // chat models.
-    String system = "You are an instructor helping learners study independently. Create a detailed summary for the chapter below.";
-    String userPrompt = buildGeminiPrompt(language, chapterTitle, chapterText);
-    try {
-      String response = callOllamaChat(system, userPrompt, Duration.ofSeconds(75));
-      if (response == null || response.isBlank()) {
-        throw new IllegalStateException("Ollama API không trả về phần tóm tắt hợp lệ.");
-      }
-      return response.trim();
-    } catch (OllamaRateLimitException rateLimit) {
-      // Fallback to Gemini when Ollama cloud hits rate limits or local fallback
-      // fails.
-      return summarizeTextWithGemini(chapterTitle, chapterText, language);
-    }
-  }
-
-  private String callOllamaChat(String systemPrompt, String userPrompt, Duration timeout)
-      throws IllegalStateException {
-    String system = stripUnsupportedControlChars(systemPrompt);
-    String user = stripUnsupportedControlChars(userPrompt);
-
-    String apiKey = resolveOllamaApiKey();
-    String host = resolveOllamaHost();
-    String model = resolveOllamaModel();
-
-    try {
-      return executeOllamaChatRequest(system, user, timeout, host, model, apiKey);
-    } catch (OllamaRateLimitException rateLimit) {
-      if (isLikelyCloudHost(host, apiKey)) {
-        String localHost = resolveOllamaLocalHost();
-        if (!hostsEqual(localHost, host)) {
-          String localModel = resolveOllamaLocalModel(model);
-          try {
-            return executeOllamaChatRequest(system, user, timeout, localHost, localModel, null);
-          } catch (OllamaRateLimitException secondary) {
-            throw secondary;
-          } catch (IllegalStateException fallbackFailure) {
-            throw new IllegalStateException(
-                "Ollama cloud bị giới hạn và fallback local thất bại: " + fallbackFailure.getMessage(),
-                fallbackFailure);
-          }
-        }
-      }
-      throw rateLimit;
-    }
-  }
-
-  private String executeOllamaChatRequest(String system, String user, Duration timeout, String host, String model,
-      String apiKey) {
-    if (host == null || host.isBlank()) {
-      throw new IllegalStateException("Chưa cấu hình Ollama host.");
-    }
-    if (model == null || model.isBlank()) {
-      throw new IllegalStateException("Chưa cấu hình Ollama model.");
-    }
-
-    JsonObject requestBody = new JsonObject();
-    requestBody.addProperty("model", model);
-    JsonArray messages = new JsonArray();
-
-    JsonObject systemMessage = new JsonObject();
-    systemMessage.addProperty("role", "system");
-    systemMessage.addProperty("content", system);
-    messages.add(systemMessage);
-
-    JsonObject userMessage = new JsonObject();
-    userMessage.addProperty("role", "user");
-    userMessage.addProperty("content", user);
-    messages.add(userMessage);
-
-    requestBody.add("messages", messages);
-    requestBody.addProperty("stream", false);
-
-    String requestJson = GSON.toJson(requestBody);
-    Duration effectiveTimeout = (timeout == null || timeout.isNegative() || timeout.isZero())
-        ? Duration.ofSeconds(60)
-        : timeout;
-
-    String endpoint = normalizeOllamaEndpoint(host);
-
-    java.net.http.HttpRequest.Builder reqBuilder = java.net.http.HttpRequest.newBuilder()
-        .uri(URI.create(endpoint))
-        .timeout(effectiveTimeout)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .POST(java.net.http.HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8));
-
-    if (apiKey != null && !apiKey.isBlank()) {
-      reqBuilder.header("Authorization", "Bearer " + apiKey.trim());
-    }
-
-    java.net.http.HttpRequest req = reqBuilder.build();
-
-    try {
-      java.net.http.HttpResponse<String> resp = httpClient.send(req,
-          HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-      int status = resp.statusCode();
-      if (status >= 200 && status < 300) {
-        String body = resp.body();
-        try {
-          JsonObject root = JsonParser.parseString(body).getAsJsonObject();
-          String extracted = extractOllamaResponse(root);
-          if (extracted != null && !extracted.isBlank()) {
-            return extracted.trim();
-          }
-        } catch (Exception ex) {
-          if (body != null && !body.isBlank()) {
-            return body.trim();
-          }
-        }
-        throw new IllegalStateException("Ollama API không trả về nội dung văn bản.");
-      }
-      if (status == 429) {
-        throw new OllamaRateLimitException(endpoint, resp.body());
-      }
-      if (status == 401 || status == 403) {
-        throw new IllegalStateException("Không thể xác thực với Ollama host (HTTP " + status + ")");
-      }
-      throw new IllegalStateException("Ollama API trả về HTTP " + status + ": " + resp.body());
-    } catch (InterruptedException ex) {
-      Thread.currentThread().interrupt();
-      throw new IllegalStateException("Yêu cầu Ollama bị gián đoạn: " + ex.getMessage(), ex);
-    } catch (IOException ex) {
-      throw new IllegalStateException("Không thể gọi Ollama API: " + ex.getMessage(), ex);
-    }
+    return text.trim();
   }
 
   private DocumentContext prepareDocumentContext(String uploadedFileName, DocumentContents document,
@@ -847,24 +714,8 @@ public class EbookProcessorServlet extends HttpServlet {
         String systemPrompt = language == DocumentLanguage.VIETNAMESE
             ? "Bạn là chuyên gia phân tích tài liệu. Hãy phân tích và tóm tắt nội dung tài liệu một cách chi tiết."
             : "You are a document analysis expert. Analyze and summarize the document content in detail.";
-
-        analysis = callOllamaChat(systemPrompt, prompt, Duration.ofSeconds(90));
-        if (analysis == null || analysis.isBlank()) {
-          // Fallback to Gemini
-          ensureGeminiConfigured();
-          GenerateContentResponse response = getGeminiClient().models.generateContent(
-              geminiModelCandidates(language)[0], prompt, null);
-          analysis = response != null ? response.text() : null;
-          if (analysis == null || analysis.isBlank()) {
-            // Final fallback: use first part of content
-            String body = fullContent.getBody();
-            if (body.length() > 1000) {
-              analysis = body.substring(0, 1000) + "...";
-            } else {
-              analysis = body;
-            }
-          }
-        }
+        String combinedPrompt = systemPrompt + System.lineSeparator() + System.lineSeparator() + prompt;
+        analysis = callGemini(combinedPrompt, language);
       } catch (Exception ex) {
         // Nếu không phân tích được, sử dụng một phần nội dung
         String body = fullContent.getBody();
@@ -881,10 +732,7 @@ public class EbookProcessorServlet extends HttpServlet {
         String summary;
         try {
           // Tóm tắt chương
-          summary = summarizeTextWithOllama(chapter.getTitle(), chapter.getBody(), language);
-          if (summary == null || summary.isBlank()) {
-            summary = summarizeTextWithGemini(chapter.getTitle(), chapter.getBody(), language);
-          }
+          summary = summarizeTextWithGemini(chapter.getTitle(), chapter.getBody(), language);
         } catch (Exception ex) {
           // Nếu không tóm tắt được, sử dụng một phần nội dung
           String body = chapter.getBody();
@@ -908,21 +756,37 @@ public class EbookProcessorServlet extends HttpServlet {
 
     if (language == DocumentLanguage.VIETNAMESE) {
       return String.format(Locale.forLanguageTag("vi"), String.join("%n",
-          "Hãy phân tích và tóm tắt nội dung tài liệu sau đây bằng tiếng Việt:",
-          "- Xác định chủ đề chính và các chủ đề phụ",
-          "- Liệt kê các khái niệm, công thức, hoặc điểm quan trọng",
-          "- Tóm tắt nội dung một cách có cấu trúc và dễ hiểu",
-          "- Nếu có ví dụ hoặc số liệu quan trọng, hãy đề cập đến",
+          "Bạn là chuyên gia phân tích tài liệu. Hãy tạo bản tóm tắt có cấu trúc với đúng bốn mục như sau:",
+          "### Tổng quan",
+          "- Viết 2-3 câu nêu mục tiêu, bối cảnh và phạm vi của tài liệu.",
+          "### Điểm trọng tâm",
+          "- Liệt kê 4-6 gạch đầu dòng về ý chính, công thức, quy trình hoặc dữ kiện nổi bật (giữ nguyên thuật ngữ chuyên ngành).",
+          "### Thuật ngữ & Khái niệm cần nhớ",
+          "- Liệt kê 3-5 thuật ngữ then chốt kèm diễn giải ngắn (mỗi thuật ngữ một gạch đầu dòng).",
+          "### Gợi ý học tập/ứng dụng",
+          "- Viết 2-3 câu đề xuất cách vận dụng, câu hỏi tự phản tư hoặc bước tiếp theo cho người học.",
+          "Yêu cầu chung:",
+          "- Giữ định dạng tiêu đề và gạch đầu dòng như trên.",
+          "- Nhắc tới ví dụ hoặc số liệu quan trọng nếu xuất hiện trong nội dung.",
+          "- Ngôn ngữ trả về là tiếng Việt.",
           "Nội dung tài liệu (đã cắt ngắn nếu quá dài):",
           "%s"), trimmedText);
     }
 
     return String.format(Locale.ENGLISH, String.join("%n",
-        "Please analyze and summarize the following document content in English:",
-        "- Identify main and sub-topics",
-        "- List key concepts, formulas, or important points",
-        "- Summarize the content in a structured and understandable way",
-        "- Mention any important examples or figures if present",
+        "You are a document analysis expert. Produce a structured summary using exactly four sections:",
+        "### Executive Summary",
+        "- Provide 2-3 sentences on objectives, context, and scope.",
+        "### Key Insights",
+        "- List 4-6 bullet points covering core ideas, formulas, workflows, or critical data (preserve technical terminology).",
+        "### Critical Terms",
+        "- List 3-5 essential terms with brief explanations (one bullet per term).",
+        "### Study Recommendations",
+        "- Write 2-3 sentences suggesting applications, reflection prompts, or next steps for learners.",
+        "General requirements:",
+        "- Keep the headings and bullet formatting exactly as defined.",
+        "- Surface notable examples or figures when present.",
+        "- Respond in English.",
         "Document content (truncated if necessary):",
         "%s"), trimmedText);
   }
@@ -1020,12 +884,8 @@ public class EbookProcessorServlet extends HttpServlet {
         : "You are an educational measurement expert who produces high-quality adaptive multiple-choice banks.";
 
     String userPrompt = buildQuestionBankPrompt(language, document.getMetadata(), chapters);
-    String rawResponse;
-    try {
-      rawResponse = callOllamaChat(systemPrompt, userPrompt, Duration.ofSeconds(180));
-    } catch (OllamaRateLimitException rateLimit) {
-      rawResponse = fallbackQuestionBankWithGemini(language, systemPrompt, userPrompt);
-    }
+    String combinedPrompt = systemPrompt + System.lineSeparator() + System.lineSeparator() + userPrompt;
+    String rawResponse = callGemini(combinedPrompt, language);
     if (rawResponse == null || rawResponse.isBlank()) {
       throw new IllegalStateException("Hệ thống không trả về nội dung ngân hàng câu hỏi.");
     }
@@ -1100,81 +960,36 @@ public class EbookProcessorServlet extends HttpServlet {
       instructions = String.join("\n",
           "Hãy tạo ra CHÍNH XÁC 150 câu hỏi trắc nghiệm bốn lựa chọn dựa trên nội dung giáo trình bên dưới.",
           "Yêu cầu bắt buộc:",
-          "1. Mỗi câu hỏi tập trung vào một khái niệm/h kỹ-năng quan trọng, không hỏi chung chung.",
+          "1. Mỗi câu hỏi tập trung vào một khái niệm hoặc kỹ năng quan trọng, không hỏi chung chung.",
           "2. Trả về DUY NHẤT một mảng JSON, không kèm giải thích hay văn bản khác.",
           "3. Mỗi phần tử phải có cấu trúc: {\"question\", \"options\", \"answer\", \"difficulty\"}.",
-          "   - \"options\" là mảng 4 lựa chọn rõ ràng, không trùng nhau.",
-          "   - \"answer\" khớp chính xác với một lựa chọn trong \"options\" (không chỉ dùng chữ cái).",
-          "   - \"difficulty\" chỉ nhận một trong ba giá trị: Easy, Medium, Hard.",
-          "4. Phân bố độ khó cân bằng (xấp xỉ 1/3 mỗi mức) và hỗ trợ kiểm tra thích ứng (IRT 3 tham số).",
-          "5. Chỉ sử dụng thông tin tồn tại trong giáo trình. Không tự bịa dữ liệu.",
-          "6. Không nhúng JSON trong mã Markdown. Không dùng chú thích thêm.",
+          "   - \"question\": câu hỏi rõ ràng, không nhúng đáp án.",
+          "   - \"options\": mảng 4 chuỗi thuần văn bản, không đánh số, không ký tự A/B/C/D, không ký hiệu đặc biệt thừa.",
+          "   - \"answer\": SAO CHÉP NGUYÊN VĂN một trong bốn chuỗi trong \"options\" (khớp 100%). Tuyệt đối không dùng chữ cái hoặc mô tả ngắn.",
+          "   - \"difficulty\": chỉ nhận một trong ba giá trị: Easy, Medium, Hard.",
+          "4. Trước khi trả kết quả, hãy rà soát từng câu để bảo đảm \"answer\" khớp chính xác (kể cả dấu, chữ hoa/thường) với một phần tử của \"options\".",
+          "5. Phân bố độ khó cân bằng (xấp xỉ 1/3 mỗi mức) và hỗ trợ kiểm tra thích ứng (IRT 3 tham số).",
+          "6. Chỉ sử dụng thông tin tồn tại trong giáo trình. Không tự bịa dữ liệu.",
+          "7. Không nhúng JSON trong mã Markdown. Không dùng chú thích thêm.",
           "Nội dung giáo trình:\n" + context.toString());
     } else {
       instructions = String.join("\n",
           "Generate EXACTLY 150 four-option multiple-choice questions from the course content below.",
           "Constraints:",
-          "1. Focus each question on a precise concept or skill from the material.",
-          "2. Return a single JSON array only, no additional commentary.",
-          "3. Each item must include keys: {\"question\", \"options\", \"answer\", \"difficulty\"}.",
-          "   - \"options\": array of four distinct, fully written choices.",
-          "   - \"answer\": match exactly one option string (not just a letter).",
+          "1. Each question must target a specific concept or skill from the material.",
+          "2. Return a single JSON array only, with no commentary or extra text.",
+          "3. Every item MUST include: {\"question\", \"options\", \"answer\", \"difficulty\"}.",
+          "   - \"question\": a clear prompt without embedding the answer.",
+          "   - \"options\": an array of four plain-text choices. Do not prepend letters, numbering, or extra symbols.",
+          "   - \"answer\": COPY the exact text of one element in \"options\" (character-for-character). Never respond with just a letter or abstract description.",
           "   - \"difficulty\": one of Easy, Medium, Hard.",
-          "4. Keep difficulty roughly balanced (≈1/3 each) to support adaptive testing.",
-          "5. Use only facts stated in the source material. No fabricated details.",
-          "6. Do NOT wrap the JSON in Markdown code fences.",
+          "4. Before returning the JSON, double-check that each \"answer\" string matches one of the four \"options\" exactly (including punctuation and casing).",
+          "5. Keep difficulty roughly balanced (≈1/3 each level) to support adaptive testing.",
+          "6. Use only facts stated in the source material. No fabrication.",
+          "7. DO NOT wrap the JSON in Markdown code fences or add annotations.",
           "Course corpus:\n" + context.toString());
     }
     return instructions;
-  }
-
-  private String fallbackQuestionBankWithGemini(DocumentLanguage language, String systemPrompt, String userPrompt) {
-    String combinedPrompt = systemPrompt + System.lineSeparator() + System.lineSeparator() + userPrompt;
-    try {
-      return callGeminiForJson(combinedPrompt, language);
-    } catch (IllegalStateException ex) {
-      throw new IllegalStateException(
-          "Ollama bị giới hạn và fallback Gemini thất bại: " + ex.getMessage(), ex);
-    }
-  }
-
-  private String callGeminiForJson(String prompt, DocumentLanguage language) {
-    ensureGeminiConfigured();
-
-    GenerateContentResponse response = null;
-    RuntimeException lastModelException = null;
-    String[] candidates = geminiModelCandidates(language);
-    if (candidates.length == 0) {
-      throw new IllegalStateException("Không tìm thấy cấu hình model Gemini phù hợp cho ngôn ngữ.");
-    }
-    for (String modelName : candidates) {
-      try {
-        response = getGeminiClient().models.generateContent(modelName, prompt, null);
-        lastModelException = null;
-        break;
-      } catch (RuntimeException ex) {
-        if (isModelNotFound(ex)) {
-          lastModelException = ex;
-          continue;
-        }
-        throw new IllegalStateException("Không thể gọi Gemini API: " + ex.getMessage(), ex);
-      }
-    }
-
-    if (response == null) {
-      if (lastModelException != null) {
-        throw new IllegalStateException(
-            "Không thể gọi Gemini API với các model khả dụng. Hãy cập nhật tên model trong cấu hình.",
-            lastModelException);
-      }
-      throw new IllegalStateException("Gemini API không trả về nội dung văn bản.");
-    }
-
-    String text = response.text();
-    if (text == null || text.isBlank()) {
-      throw new IllegalStateException("Gemini API không trả về nội dung văn bản.");
-    }
-    return text.trim();
   }
 
   private List<QuestionBankItem> parseQuestionItems(String rawResponse, DocumentLanguage language) {
@@ -1386,11 +1201,147 @@ public class EbookProcessorServlet extends HttpServlet {
       if (item.answer == null || item.answer.isBlank()) {
         throw new IllegalStateException("Câu hỏi thứ " + (i + 1) + " thiếu đáp án khớp lựa chọn.");
       }
+
+      // If the answer does not exactly match one of the normalized options, attempt
+      // automated repair.
       if (!item.options.contains(item.answer)) {
-        throw new IllegalStateException(
-            "Đáp án của câu hỏi thứ " + (i + 1) + " không khớp bất kỳ lựa chọn nào.");
+        boolean repaired = tryRepairAnswer(item);
+        if (!repaired) {
+          StringBuilder detail = new StringBuilder();
+          detail.append("Đáp án của câu hỏi thứ ").append(i + 1)
+              .append(" không khớp bất kỳ lựa chọn nào. Answer='")
+              .append(item.answer).append("', options=");
+          detail.append(item.options == null ? "null" : item.options.toString());
+          throw new IllegalStateException(detail.toString());
+        }
       }
     }
+  }
+
+  /**
+   * Attempt to repair an answer that does not match any option.
+   * Returns true if a repair was made (item.answer updated), false otherwise.
+   */
+  private boolean tryRepairAnswer(QuestionBankItem item) {
+    if (item == null || item.answer == null || item.options == null || item.options.isEmpty()) {
+      return false;
+    }
+    String ans = item.answer.trim();
+    if (ans.isEmpty()) {
+      return false;
+    }
+
+    // 1) Letter-based mapping (A-H or a-h), optionally followed by punctuation.
+    java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?i)^\\s*([A-H])\\s*[\\)\\.:\\-]?").matcher(ans);
+    if (m.find()) {
+      int idx = Character.toUpperCase(m.group(1).charAt(0)) - 'A';
+      if (idx >= 0 && idx < item.options.size()) {
+        item.answer = item.options.get(idx);
+        return true;
+      }
+    }
+
+    // 2) Numeric mapping like "1)", "2." -> convert to 0-based index
+    java.util.regex.Matcher mn = java.util.regex.Pattern.compile("^\\s*(\\d+)\\s*[\\)\\.:\\-]?").matcher(ans);
+    if (mn.find()) {
+      try {
+        int idx = Integer.parseInt(mn.group(1)) - 1;
+        if (idx >= 0 && idx < item.options.size()) {
+          item.answer = item.options.get(idx);
+          return true;
+        }
+      } catch (NumberFormatException ignore) {
+        // fall through to other strategies
+      }
+    }
+
+    // 3) Direct equality, case-insensitive, or canonicalized equality (remove
+    // diacritics/non-alnum).
+    String canonicalAns = canonicalizeForComparison(ans);
+    for (String opt : item.options) {
+      if (opt == null) {
+        continue;
+      }
+      if (ans.equals(opt) || ans.equalsIgnoreCase(opt)
+          || canonicalAns.equals(canonicalizeForComparison(opt))) {
+        item.answer = opt;
+        return true;
+      }
+    }
+
+    // 4) Substring matches (option contains answer or answer contains option) -
+    // prefer exact containment.
+    for (String opt : item.options) {
+      if (opt == null) {
+        continue;
+      }
+      if (opt.contains(ans) || ans.contains(opt)) {
+        item.answer = opt;
+        return true;
+      }
+    }
+
+    // 5) Strip common leading labels from the answer and retry canonical match.
+    String stripped = ans.replaceFirst("(?i)^[A-H]\\s*[\\)\\.:\\-]\\s*", "").trim();
+    if (!stripped.equals(ans)) {
+      String canonicalStripped = canonicalizeForComparison(stripped);
+      for (String opt : item.options) {
+        if (opt == null) {
+          continue;
+        }
+        if (stripped.equals(opt) || stripped.equalsIgnoreCase(opt)
+            || canonicalStripped.equals(canonicalizeForComparison(opt))) {
+          item.answer = opt;
+          return true;
+        }
+      }
+    }
+
+    // 6) As a last resort, try fuzzy match by longest common subsequence heuristic:
+    String best = null;
+    int bestScore = -1;
+    for (String opt : item.options) {
+      if (opt == null) {
+        continue;
+      }
+      int score = longestCommonSubseqLength(canonicalAns, canonicalizeForComparison(opt));
+      if (score > bestScore) {
+        bestScore = score;
+        best = opt;
+      }
+    }
+    // Accept a fuzzy match only if it shares a substantial portion with the answer.
+    if (best != null && bestScore >= Math.max(3, canonicalAns.length() / 3)) {
+      item.answer = best;
+      return true;
+    }
+
+    return false;
+  }
+
+  // Helper: simple longest common subsequence length (dynamic programming) for
+  // small strings.
+  private int longestCommonSubseqLength(String a, String b) {
+    if (a == null || b == null || a.isEmpty() || b.isEmpty()) {
+      return 0;
+    }
+    int n = a.length(), m = b.length();
+    int[] prev = new int[m + 1];
+    int[] cur = new int[m + 1];
+    for (int i = 1; i <= n; i++) {
+      for (int j = 1; j <= m; j++) {
+        if (a.charAt(i - 1) == b.charAt(j - 1)) {
+          cur[j] = prev[j - 1] + 1;
+        } else {
+          cur[j] = Math.max(prev[j], cur[j - 1]);
+        }
+      }
+      int[] tmp = prev;
+      prev = cur;
+      cur = tmp;
+      java.util.Arrays.fill(cur, 0);
+    }
+    return prev[m];
   }
 
   private JsonObject serializeQuestionBankItem(QuestionBankItem item) {
@@ -1504,32 +1455,91 @@ public class EbookProcessorServlet extends HttpServlet {
       }
       trimmed = trimmed.trim();
     }
+
+    // Fast path: valid JSON
     try {
       JsonElement element = JsonParser.parseString(trimmed);
       if (element.isJsonArray() || element.isJsonObject()) {
         return trimmed;
       }
     } catch (RuntimeException ignore) {
-      // Fall back to substring detection below.
+      // Fall back to more robust extraction below.
     }
+
+    // Robust extraction: locate a top-level balanced array or object while being
+    // aware of quoted strings and escape sequences. This avoids naive lastIndexOf
+    // which can fail when the model emits extra brackets in text.
     int arrayStart = trimmed.indexOf('[');
-    int arrayEnd = trimmed.lastIndexOf(']');
-    if (arrayStart >= 0 && arrayEnd > arrayStart) {
-      return trimmed.substring(arrayStart, arrayEnd + 1);
+    if (arrayStart >= 0) {
+      int arrayEnd = findMatchingBracketIndex(trimmed, arrayStart, '[', ']');
+      if (arrayEnd > arrayStart) {
+        return trimmed.substring(arrayStart, arrayEnd + 1);
+      }
     }
+
     int objectStart = trimmed.indexOf('{');
-    int objectEnd = trimmed.lastIndexOf('}');
-    if (objectStart >= 0 && objectEnd > objectStart) {
-      return trimmed.substring(objectStart, objectEnd + 1);
+    if (objectStart >= 0) {
+      int objectEnd = findMatchingBracketIndex(trimmed, objectStart, '{', '}');
+      if (objectEnd > objectStart) {
+        return trimmed.substring(objectStart, objectEnd + 1);
+      }
     }
+
     return null;
+  }
+
+  /**
+   * Find the index of the matching closing bracket/brace for the opening
+   * character at startIndex.
+   * This method is quote-aware and honors escape sequences so brackets inside
+   * strings are ignored.
+   * Returns -1 if no matching closing character is found.
+   */
+  private int findMatchingBracketIndex(String s, int startIndex, char open, char close) {
+    boolean inQuotes = false;
+    char quoteChar = 0;
+    boolean escape = false;
+    int depth = 0;
+    for (int i = startIndex; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (c == '\\') {
+        escape = true;
+        continue;
+      }
+      if (inQuotes) {
+        if (c == quoteChar) {
+          inQuotes = false;
+          quoteChar = 0;
+        }
+        continue;
+      } else {
+        if (c == '"' || c == '\'') {
+          inQuotes = true;
+          quoteChar = c;
+          continue;
+        }
+        if (c == open) {
+          depth++;
+        } else if (c == close) {
+          depth--;
+          if (depth == 0) {
+            return i;
+          }
+        }
+      }
+    }
+    return -1;
   }
 
   private String normalizeOptionText(String value) {
     if (value == null) {
       return null;
     }
-    String stripped = value.trim();
+    String stripped = stripEnclosingQuotes(value).trim();
     stripped = stripped.replaceFirst("^(?i)[A-H]\\s*[:\\).\\-]+\\s*", "");
     stripped = stripped.replaceFirst("^\\u2022\\s*", "");
     stripped = stripped.replaceFirst("^[-\\u2022]\\s*", "");
@@ -1542,7 +1552,7 @@ public class EbookProcessorServlet extends HttpServlet {
     if (rawAnswer == null) {
       return null;
     }
-    String trimmed = rawAnswer.trim();
+    String trimmed = stripEnclosingQuotes(rawAnswer).trim();
     if (trimmed.isEmpty()) {
       return null;
     }
@@ -1555,12 +1565,61 @@ public class EbookProcessorServlet extends HttpServlet {
         }
       }
       for (String option : options) {
+        if (trimmed.equals(option)) {
+          return option;
+        }
+      }
+      for (String option : options) {
         if (trimmed.equalsIgnoreCase(option)) {
+          return option;
+        }
+      }
+      String canonicalAnswer = canonicalizeForComparison(trimmed);
+      for (String option : options) {
+        if (canonicalAnswer.equals(canonicalizeForComparison(option))) {
           return option;
         }
       }
     }
     return trimmed;
+  }
+
+  private String stripEnclosingQuotes(String input) {
+    if (input == null) {
+      return null;
+    }
+    String trimmed = input.trim();
+    if (trimmed.length() >= 2) {
+      char first = trimmed.charAt(0);
+      char last = trimmed.charAt(trimmed.length() - 1);
+      if ((first == '"' && last == '"') || (first == '\'' && last == '\'')
+          || (first == '“' && last == '”') || (first == '”' && last == '“')
+          || (first == '‘' && last == '’') || (first == '’' && last == '‘')
+          || (first == '«' && last == '»')) {
+        return trimmed.substring(1, trimmed.length() - 1);
+      }
+    }
+    return trimmed;
+  }
+
+  private String canonicalizeForComparison(String value) {
+    if (value == null) {
+      return "";
+    }
+    String normalized = Normalizer.normalize(value, Normalizer.Form.NFD);
+    StringBuilder sb = new StringBuilder(normalized.length());
+    for (int i = 0; i < normalized.length(); i++) {
+      char c = normalized.charAt(i);
+      int type = Character.getType(c);
+      if (type == Character.NON_SPACING_MARK || type == Character.COMBINING_SPACING_MARK
+          || type == Character.ENCLOSING_MARK) {
+        continue;
+      }
+      if (Character.isLetterOrDigit(c)) {
+        sb.append(Character.toLowerCase(c));
+      }
+    }
+    return sb.toString();
   }
 
   private String formatDifficultyLabel(String source) {
@@ -1606,214 +1665,6 @@ public class EbookProcessorServlet extends HttpServlet {
       return null;
     }
     return element.getAsString();
-  }
-
-  private String extractOllamaResponse(JsonObject root) {
-    if (root == null) {
-      return null;
-    }
-
-    if (root.has("output") && root.get("output").isJsonArray()) {
-      for (var elem : root.getAsJsonArray("output")) {
-        if (!elem.isJsonObject()) {
-          continue;
-        }
-        JsonObject obj = elem.getAsJsonObject();
-        String viaContent = extractContentParts(obj.get("content"));
-        if (viaContent != null && !viaContent.isBlank()) {
-          return viaContent;
-        }
-        String viaMessage = extractContentParts(obj.get("message"));
-        if (viaMessage != null && !viaMessage.isBlank()) {
-          return viaMessage;
-        }
-      }
-    }
-
-    if (root.has("choices") && root.get("choices").isJsonArray()) {
-      for (var choice : root.getAsJsonArray("choices")) {
-        if (!choice.isJsonObject()) {
-          continue;
-        }
-        JsonObject co = choice.getAsJsonObject();
-        String viaMessage = extractContentParts(co.get("message"));
-        if (viaMessage != null && !viaMessage.isBlank()) {
-          return viaMessage;
-        }
-      }
-    }
-
-    if (root.has("message")) {
-      String viaMessage = extractContentParts(root.get("message"));
-      if (viaMessage != null && !viaMessage.isBlank()) {
-        return viaMessage;
-      }
-    }
-
-    if (root.has("response") && root.get("response").isJsonPrimitive()) {
-      return root.get("response").getAsString();
-    }
-
-    if (root.has("output_text") && root.get("output_text").isJsonPrimitive()) {
-      return root.get("output_text").getAsString();
-    }
-
-    if (root.has("content") && root.get("content").isJsonPrimitive()) {
-      return root.get("content").getAsString();
-    }
-
-    return null;
-  }
-
-  private String extractContentParts(com.google.gson.JsonElement element) {
-    if (element == null || element.isJsonNull()) {
-      return null;
-    }
-
-    if (element.isJsonPrimitive()) {
-      return element.getAsString();
-    }
-
-    if (!element.isJsonObject()) {
-      return null;
-    }
-
-    JsonObject obj = element.getAsJsonObject();
-    if (obj.has("content") && obj.get("content").isJsonPrimitive()) {
-      return obj.get("content").getAsString();
-    }
-
-    if (obj.has("parts") && obj.get("parts").isJsonArray()) {
-      StringBuilder sb = new StringBuilder();
-      obj.getAsJsonArray("parts").forEach(p -> sb.append(p.getAsString()));
-      return sb.toString();
-    }
-
-    if (obj.has("message")) {
-      return extractContentParts(obj.get("message"));
-    }
-
-    if (obj.has("content") && obj.get("content").isJsonObject()) {
-      return extractContentParts(obj.get("content"));
-    }
-
-    return null;
-  }
-
-  private String stripUnsupportedControlChars(String input) {
-    if (input == null || input.isEmpty()) {
-      return "";
-    }
-    StringBuilder sb = new StringBuilder(input.length());
-    for (int i = 0; i < input.length(); i++) {
-      char c = input.charAt(i);
-      if (c >= 0x20 || c == '\n' || c == '\r' || c == '\t') {
-        sb.append(c);
-      }
-    }
-    return sb.toString();
-  }
-
-  // Ollama config resolvers - read from environment variables or system
-  // properties.
-  private String resolveOllamaApiKey() {
-    String v = System.getenv("OLLAMA_API_KEY");
-    if (v == null || v.isBlank()) {
-      v = System.getProperty("ollama.api.key");
-    }
-    if (v == null || v.isBlank()) {
-      return null;
-    }
-    return v.trim();
-  }
-
-  private String resolveOllamaHost() {
-    String v = System.getenv("OLLAMA_HOST");
-    if (v == null || v.isBlank()) {
-      v = System.getProperty("ollama.host");
-    }
-    String apiKey = resolveOllamaApiKey();
-    if (v == null || v.isBlank()) {
-      return (apiKey != null && !apiKey.isBlank()) ? OLLAMA_DEFAULT_CLOUD_HOST : OLLAMA_DEFAULT_LOCAL_HOST;
-    }
-    return v.trim();
-  }
-
-  private String resolveOllamaModel() {
-    String v = System.getenv("OLLAMA_MODEL");
-    if (v == null || v.isBlank()) {
-      v = System.getProperty("ollama.model");
-    }
-    String apiKey = resolveOllamaApiKey();
-    if (v == null || v.isBlank()) {
-      return (apiKey != null && !apiKey.isBlank()) ? OLLAMA_DEFAULT_CLOUD_MODEL : OLLAMA_DEFAULT_LOCAL_MODEL;
-    }
-    return v.trim();
-  }
-
-  private String resolveOllamaLocalHost() {
-    String v = System.getenv("OLLAMA_LOCAL_HOST");
-    if (v == null || v.isBlank()) {
-      v = System.getProperty("ollama.local.host");
-    }
-    if (v == null || v.isBlank()) {
-      return OLLAMA_DEFAULT_LOCAL_HOST;
-    }
-    return v.trim();
-  }
-
-  private String resolveOllamaLocalModel(String primaryModel) {
-    String v = System.getenv("OLLAMA_LOCAL_MODEL");
-    if (v == null || v.isBlank()) {
-      v = System.getProperty("ollama.local.model");
-    }
-    if (v == null || v.isBlank()) {
-      if (primaryModel != null && !primaryModel.isBlank()) {
-        return primaryModel.trim();
-      }
-      return OLLAMA_DEFAULT_LOCAL_MODEL;
-    }
-    return v.trim();
-  }
-
-  private boolean isLikelyCloudHost(String host, String apiKey) {
-    if (apiKey != null && !apiKey.isBlank()) {
-      return true;
-    }
-    if (host == null || host.isBlank()) {
-      return false;
-    }
-    String normalized = host.trim().toLowerCase(Locale.ROOT);
-    return normalized.contains("ollama.com") || normalized.contains("cloud");
-  }
-
-  private String normalizeOllamaEndpoint(String host) {
-    String base = normalizeHostBase(host);
-    if (base.endsWith("/api/chat")) {
-      return base;
-    }
-    if (base.endsWith("/api/chat/")) {
-      return base.substring(0, base.length() - 1);
-    }
-    if (base.endsWith("/")) {
-      return base + "api/chat";
-    }
-    return base + "/api/chat";
-  }
-
-  private boolean hostsEqual(String a, String b) {
-    return normalizeHostBase(a).equals(normalizeHostBase(b));
-  }
-
-  private String normalizeHostBase(String host) {
-    if (host == null) {
-      return "";
-    }
-    String trimmed = host.trim();
-    if (trimmed.endsWith("/")) {
-      return trimmed.substring(0, trimmed.length() - 1);
-    }
-    return trimmed;
   }
 
   private String resolveDownloadBookTitle(EbookMetadata metadata, String uploadedFileName) {
@@ -2784,26 +2635,6 @@ public class EbookProcessorServlet extends HttpServlet {
     String normalized = message.toLowerCase(Locale.ROOT);
     return normalized.contains("404") || normalized.contains("not found")
         || normalized.contains("unsupported") || normalized.contains("does not exist");
-  }
-
-  private static final class OllamaRateLimitException extends IllegalStateException {
-    private static final long serialVersionUID = 1L;
-
-    private OllamaRateLimitException(String endpoint, String responseBody) {
-      super(buildMessage(endpoint, responseBody));
-    }
-
-    private static String buildMessage(String endpoint, String responseBody) {
-      String trimmedBody = responseBody == null ? "" : responseBody.trim();
-      if (trimmedBody.length() > 240) {
-        trimmedBody = trimmedBody.substring(0, 240) + "...";
-      }
-      String location = endpoint == null ? "Ollama" : endpoint;
-      if (trimmedBody.isEmpty()) {
-        return "Ollama API trả về HTTP 429 từ " + location;
-      }
-      return "Ollama API trả về HTTP 429 từ " + location + ": " + trimmedBody;
-    }
   }
 
   private static final class QuestionBankItem {

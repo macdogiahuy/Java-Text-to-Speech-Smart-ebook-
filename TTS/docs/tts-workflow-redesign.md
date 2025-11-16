@@ -29,7 +29,7 @@
 2. **Summarize Content**
 
    - For documents with ≥2 chapters:
-     - Generate summaries for each chapter immediately after parsing using the existing Ollama/Gemini helper.
+    - Generate summaries for each chapter immediately after parsing using the existing Gemini helper.
      - Store the summaries in session alongside chapter IDs, but mark audio status as "not generated".
    - For documents with <2 chapters:
      - Run a whole-document analysis helper that produces:

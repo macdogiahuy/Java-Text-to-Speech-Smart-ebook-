@@ -5,7 +5,7 @@ chapter summaries and audio. It performs the following tasks:
 
 - Extracts text and metadata from a PDF/DOCX using Apache PDFBox / Apache POI
 - Splits the text into chapters (heuristic headings)
-- Summarizes each chapter using an LLM (Google Gemini by default or Ollama)
+- Summarizes each chapter using Google Gemini
 - Generates spoken audio for each chapter summary using iFLYTEK TTS (streaming WebSocket)
 - Presents results in a web UI and allows downloading all chapter audio as a single zip
 
@@ -19,9 +19,8 @@ This README documents how to configure, run, and troubleshoot the project.
 - Apache Maven 3.6+ (3.8+/3.9+ recommended)
 - Servlet container compatible with Jakarta EE (Tomcat 10, Payara, GlassFish 7, etc.)
 - Optional services / accounts:
-  - Google Gemini API access (or other LLM)
+  - Google Gemini API access
   - iFLYTEK TTS cloud credentials (for high-quality audio)
-  - Ollama (local or cloud) if you prefer using Ollama models
 
 ---
 
@@ -35,12 +34,6 @@ Core variables:
 - IFLYTEK_APP_ID
 - IFLYTEK_API_KEY
 - IFLYTEK_API_SECRET
-
-Ollama (optional, for local or cloud Ollama models):
-
-- OLLAMA_API_KEY (when using ollama.com cloud API)
-- OLLAMA_HOST (set to https://ollama.com to target cloud API; otherwise uses http://localhost:11434)
-- OLLAMA_MODEL (defaults to a sensible cloud/local model depending on OLLAMA_API_KEY presence)
 
 IFLYTEK optional overrides and tunables (also available as system properties under `iflytek.*`):
 
@@ -89,14 +82,14 @@ Download naming behaviour:
 
 ### Troubleshooting
 
-- If you see HTTP 400 from Ollama complaining about invalid characters, ensure the app is running a version that sanitizes control characters. Prompts containing binary/control characters can break JSON encoding.
+- If you see HTTP 400/404 from Gemini complaining about the request, make sure the configured model name is valid (e.g., `gemini-2.5-flash`) and that the prompt size stays within the API limits.
 - If the download ZIP contains unexpected files, ensure you are using the app `Download` button (it zips only generated chapter audio stored in the session). Files under `target/` or other app directories are not included.
 - For iFLYTEK HMAC errors, make sure your system clock is correct and credentials are valid.
 
 Logs and debugging:
 
 - Check your servlet container logs for stack traces printed by the servlet.
-- For Ollama API responses, the servlet will raise descriptive errors (HTTP code + body) when the remote host returns unexpected data.
+- For Gemini API responses, the servlet will raise descriptive errors (HTTP code + body) when the API returns unexpected data.
 
 ---
 
